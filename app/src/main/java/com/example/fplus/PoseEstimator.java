@@ -27,6 +27,8 @@ public class PoseEstimator {
     private static final String TAG = "PoseEstimator";
     private static final int INPUT_SIZE = 640;
     private static final float CONFIDENCE_THRESHOLD = 0.15f;
+    // 判定为「有效目标」的最低置信度：低于此值视为无人/误检，让黄圈回正
+    private static final float VALID_DETECTION_CONF = 0.2f;
     private static final float MIN_AREA_THRESHOLD = 0.01f;
     // 距离准星（屏幕中心）的高斯权重标准差（归一化，越大锁定范围越宽）
     private static final float CENTER_SIGMA = 0.2f;
@@ -278,14 +280,17 @@ public class PoseEstimator {
     }
 
     private void recenterRoi() {
-        int centerX = originalWidth / 2;
-        int centerY = originalHeight / 2;
-        int curCx = roiX + roiSize / 2;
-        int curCy = roiY + roiSize / 2;
-        int newCx = curCx + (int) ((centerX - curCx) * RECENTER_SMOOTH);
-        int newCy = curCy + (int) ((centerY - curCy) * RECENTER_SMOOTH);
-        roiX = Math.max(0, Math.min(originalWidth - roiSize, newCx - roiSize / 2));
-        roiY = Math.max(0, Math.min(originalHeight - roiSize, newCy - roiSize / 2));
+        float centerX = originalWidth / 2f;
+        float centerY = originalHeight / 2f;
+        float curCx = roiX + roiSize / 2f;
+        float curCy = roiY + roiSize / 2f;
+        float newCx = curCx + (centerX - curCx) * RECENTER_SMOOTH;
+        float newCy = curCy + (centerY - curCy) * RECENTER_SMOOTH;
+        // 足够接近中心时直接吸附，避免整数/浮点截断导致黄圈停在偏心几个像素
+        if (Math.abs(centerX - newCx) < 1f) newCx = centerX;
+        if (Math.abs(centerY - newCy) < 1f) newCy = centerY;
+        roiX = (int) Math.max(0, Math.min(originalWidth - roiSize, newCx - roiSize / 2f));
+        roiY = (int) Math.max(0, Math.min(originalHeight - roiSize, newCy - roiSize / 2f));
     }
 
     private void updateRoiCenter(float targetCx, float targetCy) {
@@ -377,6 +382,7 @@ public class PoseEstimator {
     private PersonPose parseOutput() {
         PersonPose bestPose = null;
         float maxScore = -1f;
+        float bestConf = 0f;
         int numPredictions = numAnchors;
 
         for (int i = 0; i < numPredictions; i++) {
@@ -426,9 +432,15 @@ public class PoseEstimator {
 
             if (score > maxScore) {
                 maxScore = score;
+                bestConf = boxConf;
                 bestPose = new PersonPose();
                 bestPose.box = box;
             }
+        }
+
+        // 置信度不足时视为无有效目标，让黄圈回正（而非锁住误检）
+        if (bestPose != null && bestConf < VALID_DETECTION_CONF) {
+            bestPose = null;
         }
 
         // 更新跟踪状态

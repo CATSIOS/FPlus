@@ -25,9 +25,12 @@ public class OverlayView extends View {
     // 尺寸平滑系数
     private static final float SIZE_SMOOTH = 0.6f;
 
-    // 检测丢失计数
-    private int missingFrameCount = 0;
-    private static final int MAX_MISSING_FRAMES = 8;
+    // 检测丢失后的淡出透明度（255=不透明，0=消失）
+    private int fadeAlpha = 255;
+    // 丢失后淡出时长（纳秒）：固定 100ms 内完全消失，避免绿框原地滞留
+    private static final long FADE_DURATION_NANOS = 100_000_000L;
+    // 首次丢失帧的时间戳，用于按真实时长而非帧数淡出
+    private long lostAtNanos = 0;
 
     private int captureWidth = 0;
     private int captureHeight = 0;
@@ -69,15 +72,29 @@ public class OverlayView extends View {
         this.roiSize = roiSize;
 
         if (box == null) {
-            missingFrameCount++;
-            if (missingFrameCount >= MAX_MISSING_FRAMES) {
-                displayBox = null;
-                invalidate();
+            if (displayBox != null) {
+                if (lostAtNanos == 0) {
+                    lostAtNanos = timestampNanos;
+                }
+                long elapsed = timestampNanos - lostAtNanos;
+                if (elapsed >= FADE_DURATION_NANOS) {
+                    displayBox = null;
+                    fadeAlpha = 255;
+                    lostAtNanos = 0;
+                } else {
+                    // 按真实时长线性淡出：从 255 到 0
+                    fadeAlpha = 255 - (int) (255L * elapsed / FADE_DURATION_NANOS);
+                }
+            } else {
+                lostAtNanos = 0;
             }
+            // 无论绿框是否还在淡出，都要重绘：黄圈（ROI）回正需要持续刷新
+            invalidate();
             return;
         }
 
-        missingFrameCount = 0;
+        fadeAlpha = 255;
+        lostAtNanos = 0;
 
         if (displayBox == null) {
             displayBox = new float[4];
@@ -146,6 +163,7 @@ public class OverlayView extends View {
             float top = offsetY + (cy - h / 2) * drawHeight;
             float right = offsetX + (cx + w / 2) * drawWidth;
             float bottom = offsetY + (cy + h / 2) * drawHeight;
+            boxPaint.setAlpha(fadeAlpha);
             canvas.drawRect(left, top, right, bottom, boxPaint);
         }
     }
