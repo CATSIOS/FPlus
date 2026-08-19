@@ -192,7 +192,8 @@ public class ScreenCaptureService extends Service {
     private void processFrame(Bitmap frame) {
         long t0 = System.nanoTime();
         PoseEstimator.PersonPose pose = poseEstimator.estimate(frame);
-        long elapsed = System.nanoTime() - t0;
+        long detectTime = System.nanoTime(); // 检测完成时间戳
+        long elapsed = detectTime - t0;
         int frameWidth = frame.getWidth();
         int frameHeight = frame.getHeight();
         // frame 是复用的 captureBitmap，不 recycle
@@ -211,10 +212,13 @@ public class ScreenCaptureService extends Service {
             int roiX = poseEstimator.getRoiX();
             int roiY = poseEstimator.getRoiY();
             int roiSize = poseEstimator.getRoiSize();
-            // pose 为 null 也要调用，让 OverlayView 的 missingFrameCount 逻辑生效（框平滑消失）
+            // pose 为 null 也要调用，让 OverlayView 的丢失/衰减逻辑生效
+            float[] box = (pose != null && pose.box != null) ? pose.box.clone() : null;
             int w = frameWidth;
             int h = frameHeight;
-            mainHandler.post(() -> overlayView.updatePose(pose, w, h, roiX, roiY, roiSize));
+            final float[] fBox = box;
+            final long fTime = detectTime;
+            mainHandler.post(() -> overlayView.updateDetection(fBox, w, h, roiX, roiY, roiSize, fTime));
         }
     }
 

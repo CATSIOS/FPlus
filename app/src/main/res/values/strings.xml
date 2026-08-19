@@ -7,9 +7,10 @@
     <string name="backend_gpu">GPU 推理</string>
     <string name="backend_cpu">CPU 推理</string>
     <string name="model_option_title">模型</string>
-    <string name="model_default">默认模型（NCHW）</string>
-    <string name="model_nhwc">NHWC 模型</string>
-    <string name="model_int8">INT8 量化（w8a16）</string>
+    <string name="model_default">640 输入（NCHW）</string>
+    <string name="model_nhwc">640 输入（NHWC）</string>
+    <string name="model_int8">640 输入（INT8 量化）</string>
+    <string name="model_416">416 输入</string>
     <string name="btn_start">开始</string>
     <string name="btn_benchmark">自动测速</string>
     <string name="benchmark_placeholder">尚未测速</string>

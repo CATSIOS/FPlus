@@ -11,20 +11,26 @@ public class OverlayView extends View {
     private Paint boxPaint;
     private Paint roiPaint;
 
-    private float[] smoothedBox;
-    // 中心坐标用高响应，快速跟上人物；尺寸用低响应，避免框大小抖动
-    private float centerSmoothingFactor = 0.95f;
-    private float sizeSmoothingFactor = 0.6f;
-    // 中心位移超过该阈值（归一化）时直接跳到位，消除大幅移动/换目标的滞后
-    private static final float JUMP_DISTANCE = 0.05f;
+    // 当前显示框（归一化：cx, cy, w, h），位置与尺寸做低通平滑，无速度预测
+    private float[] displayBox;
+    // 1€ 滤波器（x/y 独立）
+    private OneEuroFilter filterX;
+    private OneEuroFilter filterY;
 
+    // 1€ 滤波器参数：最小截止频率（Hz，静止平滑度）与速度系数（快速移动响应度）
+    private static final double MIN_CUTOFF = 1.5;
+    private static final double BETA = 5.0;
+    // 跳变阈值：位移超过该值视为目标切换/误检，限制最大移动量，避免框瞬移
+    private static final float MAX_JUMP = 0.2f;
+    // 尺寸平滑系数
+    private static final float SIZE_SMOOTH = 0.6f;
+
+    // 检测丢失计数
     private int missingFrameCount = 0;
     private static final int MAX_MISSING_FRAMES = 8;
 
     private int captureWidth = 0;
     private int captureHeight = 0;
-
-    // 中心裁剪范围（相对 capture 帧的像素坐标）
     private int roiX = 0;
     private int roiY = 0;
     private int roiSize = 0;
@@ -49,18 +55,23 @@ public class OverlayView extends View {
         roiPaint.setAntiAlias(true);
     }
 
-    public void updatePose(PoseEstimator.PersonPose pose, int captureWidth, int captureHeight,
-                           int roiX, int roiY, int roiSize) {
+    /**
+     * 检测帧调用：用检测框做低通平滑。
+     *
+     * @param box 归一化 [cx, cy, w, h]，null 表示本帧未检测到目标
+     */
+    public void updateDetection(float[] box, int captureWidth, int captureHeight,
+                                int roiX, int roiY, int roiSize, long timestampNanos) {
         this.captureWidth = captureWidth;
         this.captureHeight = captureHeight;
         this.roiX = roiX;
         this.roiY = roiY;
         this.roiSize = roiSize;
 
-        if (pose == null || pose.box == null) {
+        if (box == null) {
             missingFrameCount++;
             if (missingFrameCount >= MAX_MISSING_FRAMES) {
-                smoothedBox = null;
+                displayBox = null;
                 invalidate();
             }
             return;
@@ -68,25 +79,36 @@ public class OverlayView extends View {
 
         missingFrameCount = 0;
 
-        if (smoothedBox == null) {
-            smoothedBox = new float[4];
-            System.arraycopy(pose.box, 0, smoothedBox, 0, 4);
+        if (displayBox == null) {
+            displayBox = new float[4];
+            displayBox[0] = box[0];
+            displayBox[1] = box[1];
+            displayBox[2] = box[2];
+            displayBox[3] = box[3];
+            filterX = new OneEuroFilter(MIN_CUTOFF, BETA);
+            filterY = new OneEuroFilter(MIN_CUTOFF, BETA);
+            filterX.filter(box[0], timestampNanos);
+            filterY.filter(box[1], timestampNanos);
         } else {
-            float dcx = pose.box[0] - smoothedBox[0];
-            float dcy = pose.box[1] - smoothedBox[1];
+            // 跳变抑制：限制目标位置的最大移动量，防止切换/误检导致框瞬移
+            float dcx = box[0] - displayBox[0];
+            float dcy = box[1] - displayBox[1];
             float dist = (float) Math.hypot(dcx, dcy);
-
-            if (dist > JUMP_DISTANCE) {
-                // 大幅移动或换目标：直接跳到位
-                smoothedBox[0] = pose.box[0];
-                smoothedBox[1] = pose.box[1];
-            } else {
-                smoothedBox[0] += centerSmoothingFactor * dcx;
-                smoothedBox[1] += centerSmoothingFactor * dcy;
+            float targetCx = box[0];
+            float targetCy = box[1];
+            if (dist > MAX_JUMP) {
+                float scale = MAX_JUMP / dist;
+                targetCx = displayBox[0] + dcx * scale;
+                targetCy = displayBox[1] + dcy * scale;
             }
 
-            smoothedBox[2] += sizeSmoothingFactor * (pose.box[2] - smoothedBox[2]);
-            smoothedBox[3] += sizeSmoothingFactor * (pose.box[3] - smoothedBox[3]);
+            // 1€ 滤波器平滑中心（自适应：静止强平滑滤抖、快速移动弱平滑跟手）
+            displayBox[0] = (float) filterX.filter(targetCx, timestampNanos);
+            displayBox[1] = (float) filterY.filter(targetCy, timestampNanos);
+
+            // 尺寸平滑
+            displayBox[2] += SIZE_SMOOTH * (box[2] - displayBox[2]);
+            displayBox[3] += SIZE_SMOOTH * (box[3] - displayBox[3]);
         }
 
         invalidate();
@@ -115,11 +137,11 @@ public class OverlayView extends View {
             canvas.drawCircle(roiCx, roiCy, roiRadius, roiPaint);
         }
 
-        if (smoothedBox != null) {
-            float cx = smoothedBox[0];
-            float cy = smoothedBox[1];
-            float w = smoothedBox[2];
-            float h = smoothedBox[3];
+        if (displayBox != null) {
+            float cx = displayBox[0];
+            float cy = displayBox[1];
+            float w = displayBox[2];
+            float h = displayBox[3];
             float left = offsetX + (cx - w / 2) * drawWidth;
             float top = offsetY + (cy - h / 2) * drawHeight;
             float right = offsetX + (cx + w / 2) * drawWidth;
