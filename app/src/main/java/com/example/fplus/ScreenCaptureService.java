@@ -61,6 +61,14 @@ public class ScreenCaptureService extends Service {
     private int captureWidth;
     private int captureHeight;
 
+    // 复用缓冲，避免每帧分配
+    private int[] capturePixels;
+    private Bitmap captureBitmap;
+
+    // 帧耗时统计
+    private long estimateTimeAccum;
+    private int frameCount;
+
     public static ScreenCaptureService getInstance() {
         return instance;
     }
@@ -93,9 +101,16 @@ public class ScreenCaptureService extends Service {
         }
 
         SharedPreferences prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
-        boolean useGpu = prefs.getBoolean("use_gpu", false);
+        String backendName = prefs.getString("backend", PoseEstimator.Backend.GPU.name());
+        PoseEstimator.Backend backend;
         try {
-            poseEstimator = new PoseEstimator(this, useGpu);
+            backend = PoseEstimator.Backend.valueOf(backendName);
+        } catch (IllegalArgumentException e) {
+            backend = PoseEstimator.Backend.CPU;
+        }
+        String modelName = prefs.getString("model_name", "sunxds_0.8.0.tflite");
+        try {
+            poseEstimator = new PoseEstimator(this, modelName, backend);
         } catch (Exception e) {
             Log.e(TAG, "Failed to load pose estimator", e);
             stopSelf();
@@ -175,10 +190,23 @@ public class ScreenCaptureService extends Service {
     }
 
     private void processFrame(Bitmap frame) {
+        long t0 = System.nanoTime();
         PoseEstimator.PersonPose pose = poseEstimator.estimate(frame);
+        long elapsed = System.nanoTime() - t0;
         int frameWidth = frame.getWidth();
         int frameHeight = frame.getHeight();
-        frame.recycle();
+        // frame 是复用的 captureBitmap，不 recycle
+
+        // 每 30 帧统计一次平均耗时
+        estimateTimeAccum += elapsed;
+        frameCount++;
+        if (frameCount >= 30) {
+            long avgMs = estimateTimeAccum / frameCount / 1_000_000;
+            Log.d(TAG, "avg estimate=" + avgMs + "ms (~" + (1000 / Math.max(1, avgMs)) + "fps)");
+            frameCount = 0;
+            estimateTimeAccum = 0;
+        }
+
         if (overlayView != null) {
             int roiX = poseEstimator.getRoiX();
             int roiY = poseEstimator.getRoiY();
@@ -203,7 +231,11 @@ public class ScreenCaptureService extends Service {
         int rowPadding = rowStride - pixelStride * captureWidth;
 
         buffer.rewind();
-        int[] pixels = new int[captureWidth * captureHeight];
+        int len = captureWidth * captureHeight;
+        if (capturePixels == null || capturePixels.length != len) {
+            capturePixels = new int[len];
+        }
+        int[] pixels = capturePixels;
         int outIndex = 0;
 
         if (pixelStride == 4) {
@@ -234,9 +266,13 @@ public class ScreenCaptureService extends Service {
             }
         }
 
-        Bitmap bitmap = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
-        bitmap.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
-        return bitmap;
+        if (captureBitmap == null
+                || captureBitmap.getWidth() != captureWidth
+                || captureBitmap.getHeight() != captureHeight) {
+            captureBitmap = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
+        }
+        captureBitmap.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
+        return captureBitmap;
     }
 
     private void addOverlayView() {
@@ -308,6 +344,10 @@ public class ScreenCaptureService extends Service {
         if (poseEstimator != null) {
             poseEstimator.close();
             poseEstimator = null;
+        }
+        if (captureBitmap != null) {
+            captureBitmap.recycle();
+            captureBitmap = null;
         }
         removeOverlayView();
         instance = null;

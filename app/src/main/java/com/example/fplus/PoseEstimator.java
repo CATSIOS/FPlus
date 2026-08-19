@@ -3,16 +3,21 @@ package com.example.fplus;
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Rect;
 import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
 import org.tensorflow.lite.gpu.CompatibilityList;
 import org.tensorflow.lite.gpu.GpuDelegate;
+import org.tensorflow.lite.nnapi.NnApiDelegate;
 
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
@@ -26,17 +31,32 @@ public class PoseEstimator {
     private static final float CONFIDENCE_THRESHOLD = 0.2f;
     private static final float MIN_AREA_THRESHOLD = 0.01f;
     private static final float CENTER_BIAS_WEIGHT = 0.5f;
+    // ROI（黄框）占短边的比例，缩小让识别区域更聚焦中心
+    private static final float ROI_SCALE = 0.7f;
+    private static final float INV_255 = 1f / 255f;
 
     private Interpreter interpreter;
     private GpuDelegate gpuDelegate;
-    private boolean useGpu;
+    private NnApiDelegate nnApiDelegate;
+    private Backend backend;
     private ByteBuffer inputBuffer;
+    private FloatBuffer inputFloatBuffer;
+    private float[] inputFloats;
+    private int[] pixels;
+    private Bitmap scaledRoi;
+    private Canvas scaleCanvas;
+    private Paint scalePaint;
+    private Rect scaleRect;
+    private Rect scaleSrcRect;
     private float[][][] output;
 
     // 输出维度顺序：true 表示 [1, channels, anchors]，false 表示 [1, anchors, channels]
     private boolean channelFirst = true;
     private int numChannels = 0;
     private int numAnchors = 0;
+
+    // 输入维度顺序：true 表示 NCHW [1,3,H,W]，false 表示 NHWC [1,H,W,3]
+    private boolean inputNchw = true;
 
     private int roiX;
     private int roiY;
@@ -50,64 +70,62 @@ public class PoseEstimator {
     private static final int MAX_TRACK_LOST = 20;
     private static final float TRACK_IOU_THRESHOLD = 0.2f;
 
+    // 分阶段计时统计
+    private long preprocessAccum;
+    private long convertAccum;
+    private long inferAccum;
+    private long parseAccum;
+    private int timingFrames;
+    private static final int TIMING_WINDOW = 30;
+
+    public enum Backend {
+        CPU, GPU, NNAPI
+    }
+
     public static class PersonPose {
         public float[] box;
     }
 
-    public PoseEstimator(Context context, boolean useGpu) throws IOException {
-        MappedByteBuffer modelBuffer = loadModelFile(context, "sunxds_0.8.0.tflite");
+    public PoseEstimator(Context context, String modelName, Backend preferred) throws IOException {
+        MappedByteBuffer modelBuffer = loadModelFile(context, modelName);
 
-        Interpreter.Options options = new Interpreter.Options();
-        options.setNumThreads(4);
-
-        GpuDelegate gpuDelegate = null;
-        boolean gpuActive = false;
-
-        if (useGpu) {
+        // 按优先级逐次回退：NPU → GPU → CPU，从用户首选开始
+        IOException lastError = null;
+        for (Backend b : fallbackOrder(preferred)) {
             try {
-                CompatibilityList compatibilityList = new CompatibilityList();
-                if (compatibilityList.isDelegateSupportedOnThisDevice()) {
-                    gpuDelegate = new GpuDelegate();
-                    options.addDelegate(gpuDelegate);
-                    gpuActive = true;
-                } else {
-                    Log.w(TAG, "GPU delegate 不受支持，回退 CPU");
+                if (tryCreateInterpreter(modelBuffer, b)) {
+                    this.backend = b;
+                    Log.d(TAG, b + " interpreter initialized");
+                    break;
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "创建 GPU delegate 失败，回退 CPU", t);
-                if (gpuDelegate != null) {
-                    gpuDelegate.close();
-                    gpuDelegate = null;
-                }
-                gpuActive = false;
+                lastError = new IOException(b + " 初始化失败", t);
+                Log.w(TAG, b + " 初始化失败，尝试下一级", t);
             }
         }
 
-        this.gpuDelegate = gpuDelegate;
-        this.useGpu = gpuActive;
-
-        try {
-            interpreter = new Interpreter(modelBuffer, options);
-        } catch (Throwable t) {
-            if (gpuActive) {
-                // 模型含 GPU 不支持的算子（如 YOLOv12 注意力结构），回退 CPU
-                Log.w(TAG, "GPU 模式下模型加载失败，回退 CPU", t);
-                gpuDelegate.close();
-                this.gpuDelegate = null;
-                this.useGpu = false;
-                Interpreter.Options cpuOptions = new Interpreter.Options();
-                cpuOptions.setNumThreads(4);
-                modelBuffer.rewind();
-                interpreter = new Interpreter(modelBuffer, cpuOptions);
-            } else {
-                throw new IOException("模型加载失败", t);
-            }
+        if (interpreter == null) {
+            throw (lastError != null) ? lastError : new IOException("所有推理后端初始化失败");
         }
 
-        Log.d(TAG, (this.useGpu ? "GPU" : "CPU") + " interpreter initialized");
+        int[] inputShape = interpreter.getInputTensor(0).shape();
+        if (inputShape.length == 4 && inputShape[3] == 3) {
+            inputNchw = false;  // NHWC [1,H,W,3]
+        } else {
+            inputNchw = true;   // NCHW [1,3,H,W]
+        }
+        org.tensorflow.lite.Tensor inputTensor = interpreter.getInputTensor(0);
+        org.tensorflow.lite.Tensor.QuantizationParams inQ = inputTensor.quantizationParams();
+        Log.d(TAG, "input dtype=" + inputTensor.dataType()
+                + ", shape: " + Arrays.toString(inputShape)
+                + ", quant scale=" + inQ.getScale() + " zeroPoint=" + inQ.getZeroPoint());
 
         int[] outputShape = interpreter.getOutputTensor(0).shape();
-        Log.d(TAG, "Output shape: " + Arrays.toString(outputShape));
+        org.tensorflow.lite.Tensor outputTensor = interpreter.getOutputTensor(0);
+        org.tensorflow.lite.Tensor.QuantizationParams outQ = outputTensor.quantizationParams();
+        Log.d(TAG, "Output shape: " + Arrays.toString(outputShape)
+                + ", dtype=" + outputTensor.dataType()
+                + ", quant scale=" + outQ.getScale() + " zeroPoint=" + outQ.getZeroPoint());
         if (outputShape.length != 3) {
             interpreter.close();
             throw new IOException("Unexpected output shape: " + Arrays.toString(outputShape));
@@ -131,17 +149,96 @@ public class PoseEstimator {
         inputBuffer = ByteBuffer.allocateDirect(1 * 3 * INPUT_SIZE * INPUT_SIZE * 4);
         inputBuffer.order(ByteOrder.nativeOrder());
         inputBuffer.rewind();
+        inputFloatBuffer = inputBuffer.asFloatBuffer();
+    }
+
+    private static Backend[] fallbackOrder(Backend preferred) {
+        switch (preferred) {
+            case NNAPI:
+                return new Backend[]{Backend.NNAPI, Backend.GPU, Backend.CPU};
+            case GPU:
+                return new Backend[]{Backend.GPU, Backend.CPU};
+            case CPU:
+            default:
+                return new Backend[]{Backend.CPU};
+        }
+    }
+
+    private boolean tryCreateInterpreter(MappedByteBuffer modelBuffer, Backend backend) {
+        Interpreter.Options options = new Interpreter.Options();
+        options.setNumThreads(4);
+
+        if (backend == Backend.GPU) {
+            try {
+                CompatibilityList compatibilityList = new CompatibilityList();
+                if (!compatibilityList.isDelegateSupportedOnThisDevice()) {
+                    Log.w(TAG, "GPU delegate 不受支持");
+                    return false;
+                }
+                gpuDelegate = new GpuDelegate();
+                options.addDelegate(gpuDelegate);
+            } catch (Throwable t) {
+                Log.w(TAG, "创建 GPU delegate 失败", t);
+                closeHardwareDelegate();
+                return false;
+            }
+        } else if (backend == Backend.NNAPI) {
+            try {
+                nnApiDelegate = new NnApiDelegate();
+                options.addDelegate(nnApiDelegate);
+            } catch (Throwable t) {
+                Log.w(TAG, "创建 NNAPI delegate 失败", t);
+                closeHardwareDelegate();
+                return false;
+            }
+        }
+        // CPU 不需要 delegate
+
+        modelBuffer.rewind();
+        try {
+            interpreter = new Interpreter(modelBuffer, options);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, backend + " 模型加载失败", t);
+            closeHardwareDelegate();
+            interpreter = null;
+            return false;
+        }
     }
 
     public PersonPose estimate(Bitmap bitmap) {
         originalWidth = bitmap.getWidth();
         originalHeight = bitmap.getHeight();
 
+        long t0 = System.nanoTime();
         Bitmap resizedBitmap = preprocessBitmap(bitmap);
+        long t1 = System.nanoTime();
         bitmapToByteBuffer(resizedBitmap);
-        resizedBitmap.recycle();
+        long t2 = System.nanoTime();
         interpreter.run(inputBuffer, output);
+        long t3 = System.nanoTime();
         PersonPose pose = parseOutput();
+        long t4 = System.nanoTime();
+
+        preprocessAccum += t1 - t0;
+        convertAccum += t2 - t1;
+        inferAccum += t3 - t2;
+        parseAccum += t4 - t3;
+        timingFrames++;
+        if (timingFrames >= TIMING_WINDOW) {
+            Log.d(TAG, String.format(
+                    "阶段耗时 pre=%.1fms convert=%.1fms infer=%.1fms parse=%.1fms 合计=%.1fms",
+                    preprocessAccum / (double) timingFrames / 1_000_000,
+                    convertAccum / (double) timingFrames / 1_000_000,
+                    inferAccum / (double) timingFrames / 1_000_000,
+                    parseAccum / (double) timingFrames / 1_000_000,
+                    (preprocessAccum + convertAccum + inferAccum + parseAccum) / (double) timingFrames / 1_000_000));
+            preprocessAccum = 0;
+            convertAccum = 0;
+            inferAccum = 0;
+            parseAccum = 0;
+            timingFrames = 0;
+        }
 
         if (pose != null && pose.box != null) {
             boolean isPixelCoord = pose.box[0] > 1.5f || pose.box[1] > 1.5f ||
@@ -177,35 +274,62 @@ public class PoseEstimator {
     private Bitmap preprocessBitmap(Bitmap source) {
         int sw = source.getWidth();
         int sh = source.getHeight();
-        // 只识别中心正方形区域（FPS 目标通常在准星附近）
-        roiSize = Math.min(sw, sh);
+        roiSize = (int) (Math.min(sw, sh) * ROI_SCALE);
+
+        // 固定中心 ROI（FPS 目标通常在准星附近，固定更稳，避免 ROI 移动导致的坐标系错位）
         roiX = (sw - roiSize) / 2;
         roiY = (sh - roiSize) / 2;
 
-        Bitmap roi = Bitmap.createBitmap(source, roiX, roiY, roiSize, roiSize);
-        Bitmap scaled = Bitmap.createScaledBitmap(roi, INPUT_SIZE, INPUT_SIZE, true);
-        roi.recycle();
-        return scaled;
+        if (scaledRoi == null) {
+            scaledRoi = Bitmap.createBitmap(INPUT_SIZE, INPUT_SIZE, Bitmap.Config.ARGB_8888);
+            scaleCanvas = new Canvas(scaledRoi);
+            scalePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+            scaleRect = new Rect(0, 0, INPUT_SIZE, INPUT_SIZE);
+            scaleSrcRect = new Rect();
+        }
+        // 直接从源矩形缩放绘制，避免每帧 createBitmap/recycle 的开销
+        scaleSrcRect.set(roiX, roiY, roiX + roiSize, roiY + roiSize);
+        scaleCanvas.drawBitmap(source, scaleSrcRect, scaleRect, scalePaint);
+        return scaledRoi;
     }
 
     private void bitmapToByteBuffer(Bitmap bitmap) {
-        inputBuffer.rewind();
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
-        int[] pixels = new int[width * height];
+        int len = width * height;
+        if (pixels == null || pixels.length != len) {
+            pixels = new int[len];
+        }
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
 
-        // tflite 输入为 NCHW [1, 3, 640, 640]，float32，值 [0, 1]（/255）
-        // 先填 R 全图，再 G 全图，再 B 全图
-        for (int i = 0; i < pixels.length; i++) {
-            inputBuffer.putFloat(((pixels[i] >> 16) & 0xFF) / 255.0f);
+        int total = len * 3;
+        if (inputFloats == null || inputFloats.length != total) {
+            inputFloats = new float[total];
         }
-        for (int i = 0; i < pixels.length; i++) {
-            inputBuffer.putFloat(((pixels[i] >> 8) & 0xFF) / 255.0f);
+
+        // float32，值 [0, 1]（* 1/255）
+        if (inputNchw) {
+            // NCHW [1,3,H,W]：R 全图、G 全图、B 全图
+            for (int i = 0; i < len; i++) {
+                int p = pixels[i];
+                inputFloats[i] = ((p >> 16) & 0xFF) * INV_255;
+                inputFloats[len + i] = ((p >> 8) & 0xFF) * INV_255;
+                inputFloats[len * 2 + i] = (p & 0xFF) * INV_255;
+            }
+        } else {
+            // NHWC [1,H,W,3]：逐像素 R,G,B 连续
+            for (int i = 0; i < len; i++) {
+                int p = pixels[i];
+                int base = i * 3;
+                inputFloats[base] = ((p >> 16) & 0xFF) * INV_255;
+                inputFloats[base + 1] = ((p >> 8) & 0xFF) * INV_255;
+                inputFloats[base + 2] = (p & 0xFF) * INV_255;
+            }
         }
-        for (int i = 0; i < pixels.length; i++) {
-            inputBuffer.putFloat((pixels[i] & 0xFF) / 255.0f);
-        }
+
+        // 一次性 bulk 写入 ByteBuffer，避免每像素多次 JNI 调用
+        inputFloatBuffer.rewind();
+        inputFloatBuffer.put(inputFloats);
         inputBuffer.rewind();
     }
 
@@ -355,14 +479,30 @@ public class PoseEstimator {
         return roiSize;
     }
 
+    public Backend getBackend() {
+        return backend;
+    }
+
+    private void closeHardwareDelegate() {
+        if (gpuDelegate != null) {
+            gpuDelegate.close();
+            gpuDelegate = null;
+        }
+        if (nnApiDelegate != null) {
+            nnApiDelegate.close();
+            nnApiDelegate = null;
+        }
+    }
+
     public void close() {
         if (interpreter != null) {
             interpreter.close();
             interpreter = null;
         }
-        if (gpuDelegate != null) {
-            gpuDelegate.close();
-            gpuDelegate = null;
+        closeHardwareDelegate();
+        if (scaledRoi != null) {
+            scaledRoi.recycle();
+            scaledRoi = null;
         }
     }
 }

@@ -13,10 +13,10 @@ public class OverlayView extends View {
 
     private float[] smoothedBox;
     // 中心坐标用高响应，快速跟上人物；尺寸用低响应，避免框大小抖动
-    private float centerSmoothingFactor = 0.7f;
-    private float sizeSmoothingFactor = 0.4f;
+    private float centerSmoothingFactor = 0.95f;
+    private float sizeSmoothingFactor = 0.6f;
     // 中心位移超过该阈值（归一化）时直接跳到位，消除大幅移动/换目标的滞后
-    private static final float JUMP_DISTANCE = 0.12f;
+    private static final float JUMP_DISTANCE = 0.05f;
 
     private int missingFrameCount = 0;
     private static final int MAX_MISSING_FRAMES = 8;
@@ -107,13 +107,12 @@ public class OverlayView extends View {
         int offsetX = (viewWidth - drawWidth) / 2;
         int offsetY = (viewHeight - drawHeight) / 2;
 
-        // 画中心裁剪范围（黄色框）
+        // 画中心裁剪范围（黄色，圆形仅作视觉提示，实际 ROI 仍为方形）
         if (roiSize > 0) {
-            float roiLeft = offsetX + (roiX / (float) captureWidth) * drawWidth;
-            float roiTop = offsetY + (roiY / (float) captureHeight) * drawHeight;
-            float roiRight = offsetX + ((roiX + roiSize) / (float) captureWidth) * drawWidth;
-            float roiBottom = offsetY + ((roiY + roiSize) / (float) captureHeight) * drawHeight;
-            canvas.drawRect(roiLeft, roiTop, roiRight, roiBottom, roiPaint);
+            float roiCx = offsetX + ((roiX + roiSize / 2f) / (float) captureWidth) * drawWidth;
+            float roiCy = offsetY + ((roiY + roiSize / 2f) / (float) captureHeight) * drawHeight;
+            float roiRadius = (roiSize / 2f) / (float) captureWidth * drawWidth;
+            canvas.drawCircle(roiCx, roiCy, roiRadius, roiPaint);
         }
 
         if (smoothedBox != null) {
