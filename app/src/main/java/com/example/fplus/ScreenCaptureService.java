@@ -6,9 +6,9 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
-import android.graphics.Matrix;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.view.Display;
@@ -26,7 +26,6 @@ import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
-import android.widget.Toast;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
@@ -78,6 +77,14 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        int resultCode = Activity.RESULT_CANCELED;
+        Intent resultData = null;
+        if (intent != null) {
+            resultCode = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED);
+            resultData = intent.getParcelableExtra("resultData");
+        }
+
+        // 屏幕捕获授权已在 MainActivity 中获得，此时才能以 mediaProjection 类型启动前台服务
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, buildNotification(),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
@@ -85,8 +92,10 @@ public class ScreenCaptureService extends Service {
             startForeground(NOTIFICATION_ID, buildNotification());
         }
 
+        SharedPreferences prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
+        boolean useGpu = prefs.getBoolean("use_gpu", false);
         try {
-            poseEstimator = new PoseEstimator(this);
+            poseEstimator = new PoseEstimator(this, useGpu);
         } catch (Exception e) {
             Log.e(TAG, "Failed to load pose estimator", e);
             stopSelf();
@@ -95,24 +104,8 @@ public class ScreenCaptureService extends Service {
 
         addOverlayView();
 
-        Intent captureIntent = mediaProjectionManager.createScreenCaptureIntent();
-        startActivityForResult(captureIntent, REQUEST_CODE_CAPTURE);
-        return START_STICKY;
-    }
-
-    private static final int REQUEST_CODE_CAPTURE = 1001;
-
-    private void startActivityForResult(Intent intent, int requestCode) {
-        Intent activityIntent = new Intent(this, CapturePermissionActivity.class);
-        activityIntent.putExtra("captureIntent", intent);
-        activityIntent.putExtra("requestCode", requestCode);
-        activityIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        startActivity(activityIntent);
-    }
-
-    public void onCapturePermissionResult(boolean granted, Intent data) {
-        if (granted) {
-            mediaProjection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, data);
+        if (resultCode == Activity.RESULT_OK && resultData != null) {
+            mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData);
             projectionCallback = new MediaProjection.Callback() {
                 @Override
                 public void onStop() {
@@ -122,9 +115,10 @@ public class ScreenCaptureService extends Service {
             mediaProjection.registerCallback(projectionCallback, mainHandler);
             startCapture();
         } else {
-            Toast.makeText(this, "屏幕捕获权限被拒绝", Toast.LENGTH_SHORT).show();
+            Log.e(TAG, "No capture permission result");
             stopSelf();
         }
+        return START_NOT_STICKY;
     }
 
     private void startCapture() {
@@ -149,7 +143,7 @@ public class ScreenCaptureService extends Service {
         Log.d(TAG, "Screen real=" + metrics.widthPixels + "x" + metrics.heightPixels +
                 ", rotation=" + rotation + ", capture size=" + screenWidth + "x" + screenHeight);
 
-        // 设置捕获分辨率，保持比例，宽度最大 720
+        // 设置捕获分辨率，保持比例，宽度最大 720（模型输入 640，720 足够且省性能）
         float scale = Math.min(720f / screenWidth, 1280f / screenHeight);
         captureWidth = Math.round(screenWidth * scale);
         captureHeight = Math.round(screenHeight * scale);
@@ -181,13 +175,18 @@ public class ScreenCaptureService extends Service {
     }
 
     private void processFrame(Bitmap frame) {
-        int rotation = getScreenRotation();
-        Log.d(TAG, "Frame size: " + frame.getWidth() + "x" + frame.getHeight() + ", rotation: " + rotation);
-
         PoseEstimator.PersonPose pose = poseEstimator.estimate(frame);
+        int frameWidth = frame.getWidth();
+        int frameHeight = frame.getHeight();
+        frame.recycle();
         if (overlayView != null) {
+            int roiX = poseEstimator.getRoiX();
+            int roiY = poseEstimator.getRoiY();
+            int roiSize = poseEstimator.getRoiSize();
             // pose 为 null 也要调用，让 OverlayView 的 missingFrameCount 逻辑生效（框平滑消失）
-            mainHandler.post(() -> overlayView.updatePose(pose, frame.getWidth(), frame.getHeight()));
+            int w = frameWidth;
+            int h = frameHeight;
+            mainHandler.post(() -> overlayView.updatePose(pose, w, h, roiX, roiY, roiSize));
         }
     }
 
@@ -197,28 +196,46 @@ public class ScreenCaptureService extends Service {
     }
 
     private Bitmap imageToBitmap(Image image) {
-        Image.Plane[] planes = image.getPlanes();
-        ByteBuffer buffer = planes[0].getBuffer();
-        int pixelStride = planes[0].getPixelStride();
-        int rowStride = planes[0].getRowStride();
+        Image.Plane plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int pixelStride = plane.getPixelStride();
+        int rowStride = plane.getRowStride();
         int rowPadding = rowStride - pixelStride * captureWidth;
-        int width = captureWidth + rowPadding / pixelStride;
 
         buffer.rewind();
-        int[] pixels = new int[width * captureHeight];
-        for (int y = 0; y < captureHeight; y++) {
-            for (int x = 0; x < width; x++) {
-                int index = (y * width + x) * pixelStride;
-                int r = buffer.get(index) & 0xFF;
-                int g = buffer.get(index + 1) & 0xFF;
-                int b = buffer.get(index + 2) & 0xFF;
-                int a = buffer.get(index + 3) & 0xFF;
-                pixels[y * width + x] = (a << 24) | (r << 16) | (g << 8) | b;
+        int[] pixels = new int[captureWidth * captureHeight];
+        int outIndex = 0;
+
+        if (pixelStride == 4) {
+            // RGBA 紧密排列，顺序读取（比绝对定位 get 更快）
+            for (int y = 0; y < captureHeight; y++) {
+                for (int x = 0; x < captureWidth; x++) {
+                    int r = buffer.get() & 0xFF;
+                    int g = buffer.get() & 0xFF;
+                    int b = buffer.get() & 0xFF;
+                    int a = buffer.get() & 0xFF;
+                    pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
+                }
+                if (rowPadding > 0) {
+                    buffer.position(buffer.position() + rowPadding);
+                }
+            }
+        } else {
+            for (int y = 0; y < captureHeight; y++) {
+                int rowStart = y * rowStride;
+                for (int x = 0; x < captureWidth; x++) {
+                    int index = rowStart + x * pixelStride;
+                    int r = buffer.get(index) & 0xFF;
+                    int g = buffer.get(index + 1) & 0xFF;
+                    int b = buffer.get(index + 2) & 0xFF;
+                    int a = buffer.get(index + 3) & 0xFF;
+                    pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
+                }
             }
         }
 
         Bitmap bitmap = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
-        bitmap.setPixels(pixels, 0, width, 0, 0, captureWidth, captureHeight);
+        bitmap.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
         return bitmap;
     }
 

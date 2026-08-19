@@ -30,14 +30,6 @@
             </intent-filter>
         </activity>
 
-        <!-- 透明 Activity，用于请求屏幕捕获权限 -->
-        <activity
-            android:name=".CapturePermissionActivity"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:excludeFromRecents="true"
-            android:taskAffinity=""
-            android:exported="false" />
-
         <!-- 屏幕捕获前台服务 -->
         <service
             android:name=".ScreenCaptureService"

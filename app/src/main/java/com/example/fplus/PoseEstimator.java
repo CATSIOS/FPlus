@@ -3,11 +3,11 @@ package com.example.fplus;
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Color;
 import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
+import org.tensorflow.lite.gpu.CompatibilityList;
+import org.tensorflow.lite.gpu.GpuDelegate;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -22,12 +22,14 @@ import java.util.List;
 public class PoseEstimator {
 
     private static final String TAG = "PoseEstimator";
-    private static final int INPUT_SIZE = 320;
+    private static final int INPUT_SIZE = 640;
     private static final float CONFIDENCE_THRESHOLD = 0.2f;
     private static final float MIN_AREA_THRESHOLD = 0.01f;
     private static final float CENTER_BIAS_WEIGHT = 0.5f;
 
     private Interpreter interpreter;
+    private GpuDelegate gpuDelegate;
+    private boolean useGpu;
     private ByteBuffer inputBuffer;
     private float[][][] output;
 
@@ -36,9 +38,9 @@ public class PoseEstimator {
     private int numChannels = 0;
     private int numAnchors = 0;
 
-    private float letterboxScale;
-    private int letterboxX;
-    private int letterboxY;
+    private int roiX;
+    private int roiY;
+    private int roiSize;
 
     private int originalWidth;
     private int originalHeight;
@@ -48,35 +50,61 @@ public class PoseEstimator {
     private static final int MAX_TRACK_LOST = 20;
     private static final float TRACK_IOU_THRESHOLD = 0.2f;
 
-    public static class Keypoint {
-        public float x;
-        public float y;
-        public float confidence;
-
-        public Keypoint(float x, float y, float confidence) {
-            this.x = x;
-            this.y = y;
-            this.confidence = confidence;
-        }
-    }
-
     public static class PersonPose {
-        public List<Keypoint> keypoints;
-        public float boxConfidence;
         public float[] box;
-
-        public PersonPose() {
-            keypoints = new ArrayList<>();
-        }
     }
 
-    public PoseEstimator(Context context) throws IOException {
-        // YOLOv12 模型含注意力机制等结构，TFLite GPU delegate 支持不佳导致推理错乱，
-        // 改用 CPU 推理（模型仅 2.56M 参数 + 320 输入，CPU 足够快）
+    public PoseEstimator(Context context, boolean useGpu) throws IOException {
+        MappedByteBuffer modelBuffer = loadModelFile(context, "sunxds_0.8.0.tflite");
+
         Interpreter.Options options = new Interpreter.Options();
         options.setNumThreads(4);
-        interpreter = new Interpreter(loadModelFile(context, "sunxds_0.8.0.tflite"), options);
-        Log.d(TAG, "CPU interpreter initialized (4 threads)");
+
+        GpuDelegate gpuDelegate = null;
+        boolean gpuActive = false;
+
+        if (useGpu) {
+            try {
+                CompatibilityList compatibilityList = new CompatibilityList();
+                if (compatibilityList.isDelegateSupportedOnThisDevice()) {
+                    gpuDelegate = new GpuDelegate();
+                    options.addDelegate(gpuDelegate);
+                    gpuActive = true;
+                } else {
+                    Log.w(TAG, "GPU delegate 不受支持，回退 CPU");
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "创建 GPU delegate 失败，回退 CPU", t);
+                if (gpuDelegate != null) {
+                    gpuDelegate.close();
+                    gpuDelegate = null;
+                }
+                gpuActive = false;
+            }
+        }
+
+        this.gpuDelegate = gpuDelegate;
+        this.useGpu = gpuActive;
+
+        try {
+            interpreter = new Interpreter(modelBuffer, options);
+        } catch (Throwable t) {
+            if (gpuActive) {
+                // 模型含 GPU 不支持的算子（如 YOLOv12 注意力结构），回退 CPU
+                Log.w(TAG, "GPU 模式下模型加载失败，回退 CPU", t);
+                gpuDelegate.close();
+                this.gpuDelegate = null;
+                this.useGpu = false;
+                Interpreter.Options cpuOptions = new Interpreter.Options();
+                cpuOptions.setNumThreads(4);
+                modelBuffer.rewind();
+                interpreter = new Interpreter(modelBuffer, cpuOptions);
+            } else {
+                throw new IOException("模型加载失败", t);
+            }
+        }
+
+        Log.d(TAG, (this.useGpu ? "GPU" : "CPU") + " interpreter initialized");
 
         int[] outputShape = interpreter.getOutputTensor(0).shape();
         Log.d(TAG, "Output shape: " + Arrays.toString(outputShape));
@@ -111,6 +139,7 @@ public class PoseEstimator {
 
         Bitmap resizedBitmap = preprocessBitmap(bitmap);
         bitmapToByteBuffer(resizedBitmap);
+        resizedBitmap.recycle();
         interpreter.run(inputBuffer, output);
         PersonPose pose = parseOutput();
 
@@ -130,45 +159,33 @@ public class PoseEstimator {
                 bH /= INPUT_SIZE;
             }
 
-            float pixelCx = bCx * INPUT_SIZE;
-            float pixelCy = bCy * INPUT_SIZE;
-            float pixelW = bW * INPUT_SIZE;
-            float pixelH = bH * INPUT_SIZE;
-
-            float origCx = (pixelCx - letterboxX) / letterboxScale;
-            float origCy = (pixelCy - letterboxY) / letterboxScale;
-            float origW = pixelW / letterboxScale;
-            float origH = pixelH / letterboxScale;
+            // 中心 ROI 按 1:1 缩放到输入尺寸，归一化坐标直接映射回 ROI，再平移到原图
+            float origCx = bCx * roiSize + roiX;
+            float origCy = bCy * roiSize + roiY;
+            float origW = bW * roiSize;
+            float origH = bH * roiSize;
 
             pose.box[0] = origCx / originalWidth;
             pose.box[1] = origCy / originalHeight;
             pose.box[2] = origW / originalWidth;
             pose.box[3] = origH / originalHeight;
-
-            Log.d(TAG, "Final box: cx=" + pose.box[0] + ", cy=" + pose.box[1] +
-                    ", w=" + pose.box[2] + ", h=" + pose.box[3]);
-            Log.d(TAG, "Letterbox: scale=" + letterboxScale + ", x=" + letterboxX + ", y=" + letterboxY);
-            Log.d(TAG, "Original size: " + originalWidth + "x" + originalHeight);
         }
 
         return pose;
     }
 
     private Bitmap preprocessBitmap(Bitmap source) {
-        float scale = Math.min((float) INPUT_SIZE / source.getWidth(), (float) INPUT_SIZE / source.getHeight());
-        int newWidth = Math.round(source.getWidth() * scale);
-        int newHeight = Math.round(source.getHeight() * scale);
+        int sw = source.getWidth();
+        int sh = source.getHeight();
+        // 只识别中心正方形区域（FPS 目标通常在准星附近）
+        roiSize = Math.min(sw, sh);
+        roiX = (sw - roiSize) / 2;
+        roiY = (sh - roiSize) / 2;
 
-        letterboxScale = scale;
-        letterboxX = (INPUT_SIZE - newWidth) / 2;
-        letterboxY = (INPUT_SIZE - newHeight) / 2;
-
-        Bitmap scaled = Bitmap.createScaledBitmap(source, newWidth, newHeight, true);
-        Bitmap letterboxed = Bitmap.createBitmap(INPUT_SIZE, INPUT_SIZE, Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(letterboxed);
-        canvas.drawColor(Color.rgb(114, 114, 114));
-        canvas.drawBitmap(scaled, letterboxX, letterboxY, null);
-        return letterboxed;
+        Bitmap roi = Bitmap.createBitmap(source, roiX, roiY, roiSize, roiSize);
+        Bitmap scaled = Bitmap.createScaledBitmap(roi, INPUT_SIZE, INPUT_SIZE, true);
+        roi.recycle();
+        return scaled;
     }
 
     private void bitmapToByteBuffer(Bitmap bitmap) {
@@ -178,22 +195,16 @@ public class PoseEstimator {
         int[] pixels = new int[width * height];
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
 
-        // tflite 输入为 NCHW [1, 3, 320, 320]，float32，值 [0, 1]（/255）
+        // tflite 输入为 NCHW [1, 3, 640, 640]，float32，值 [0, 1]（/255）
         // 先填 R 全图，再 G 全图，再 B 全图
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                inputBuffer.putFloat(Color.red(pixels[y * width + x]) / 255.0f);
-            }
+        for (int i = 0; i < pixels.length; i++) {
+            inputBuffer.putFloat(((pixels[i] >> 16) & 0xFF) / 255.0f);
         }
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                inputBuffer.putFloat(Color.green(pixels[y * width + x]) / 255.0f);
-            }
+        for (int i = 0; i < pixels.length; i++) {
+            inputBuffer.putFloat(((pixels[i] >> 8) & 0xFF) / 255.0f);
         }
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                inputBuffer.putFloat(Color.blue(pixels[y * width + x]) / 255.0f);
-            }
+        for (int i = 0; i < pixels.length; i++) {
+            inputBuffer.putFloat((pixels[i] & 0xFF) / 255.0f);
         }
         inputBuffer.rewind();
     }
@@ -213,44 +224,7 @@ public class PoseEstimator {
 
         int numPredictions = numAnchors;
 
-        float bestConf = 0;
-        float bestArea = 0;
-
         List<float[]> candidateBoxes = new ArrayList<>();
-        List<Float> candidateConfs = new ArrayList<>();
-
-        // 调试：打印第一个 anchor 的原始值，确认输出格式
-        if (numPredictions > 0) {
-            Log.d(TAG, "Debug anchor[0]: cx=" + getOutputValue(0, 0) +
-                    ", cy=" + getOutputValue(1, 0) +
-                    ", w=" + getOutputValue(2, 0) +
-                    ", h=" + getOutputValue(3, 0) +
-                    ", personConf=" + getOutputValue(4, 0));
-        }
-
-        // 调试：扫描所有 anchor 所有类别，找出全局最大类别分数
-        {
-            float globalMax = 0;
-            int globalMaxClass = -1;
-            int globalMaxAnchor = -1;
-            for (int a = 0; a < numAnchors; a++) {
-                for (int c = 4; c < numChannels; c++) {
-                    float conf = getOutputValue(c, a);
-                    if (conf > globalMax) {
-                        globalMax = conf;
-                        globalMaxClass = c - 4;
-                        globalMaxAnchor = a;
-                    }
-                }
-            }
-            if (globalMaxAnchor >= 0) {
-                Log.d(TAG, "Global max: conf=" + globalMax + ", class=" + globalMaxClass +
-                        ", box(cx=" + getOutputValue(0, globalMaxAnchor) +
-                        ", cy=" + getOutputValue(1, globalMaxAnchor) +
-                        ", w=" + getOutputValue(2, globalMaxAnchor) +
-                        ", h=" + getOutputValue(3, globalMaxAnchor) + ")");
-            }
-        }
 
         for (int i = 0; i < numPredictions; i++) {
             // 取所有类别（channel 4 到 numChannels-1）的最大置信度
@@ -284,14 +258,10 @@ public class PoseEstimator {
 
             float[] box = new float[]{cx, cy, w, h};
             candidateBoxes.add(box);
-            candidateConfs.add(boxConf);
 
             if (score > maxScore) {
                 maxScore = score;
-                bestConf = boxConf;
-                bestArea = area;
                 bestPose = new PersonPose();
-                bestPose.boxConfidence = boxConf;
                 bestPose.box = box;
             }
         }
@@ -310,18 +280,14 @@ public class PoseEstimator {
 
             if (bestIou >= TRACK_IOU_THRESHOLD && bestMatchIdx >= 0) {
                 bestPose = new PersonPose();
-                bestPose.boxConfidence = candidateConfs.get(bestMatchIdx);
                 bestPose.box = candidateBoxes.get(bestMatchIdx);
                 trackedBox = candidateBoxes.get(bestMatchIdx).clone();
                 trackLostFrames = 0;
-                Log.d(TAG, "Track matched: IoU=" + bestIou + ", conf=" + bestPose.boxConfidence);
             } else {
                 trackLostFrames++;
-                Log.d(TAG, "Track lost: " + trackLostFrames + "/" + MAX_TRACK_LOST);
                 if (trackLostFrames >= MAX_TRACK_LOST) {
                     trackedBox = null;
                     trackLostFrames = 0;
-                    Log.d(TAG, "Track reset");
                 } else {
                     bestPose = null;
                 }
@@ -329,22 +295,13 @@ public class PoseEstimator {
         } else if (bestPose != null) {
             trackedBox = bestPose.box.clone();
             trackLostFrames = 0;
-            Log.d(TAG, "New track acquired, conf=" + bestConf);
         }
 
-        if (bestPose != null) {
-            Log.d(TAG, "Candidates: " + numCandidates + ", best conf=" + bestConf +
-                    ", area=" + bestArea + ", score=" + maxScore);
-            Log.d(TAG, "Raw box: [" + bestPose.box[0] + ", " + bestPose.box[1] +
-                    ", " + bestPose.box[2] + ", " + bestPose.box[3] + "]");
-        } else {
-            Log.d(TAG, "No detection");
-            if (trackedBox != null) {
-                trackLostFrames++;
-                if (trackLostFrames >= MAX_TRACK_LOST) {
-                    trackedBox = null;
-                    trackLostFrames = 0;
-                }
+        if (bestPose == null && trackedBox != null) {
+            trackLostFrames++;
+            if (trackLostFrames >= MAX_TRACK_LOST) {
+                trackedBox = null;
+                trackLostFrames = 0;
             }
         }
 
@@ -386,10 +343,26 @@ public class PoseEstimator {
         }
     }
 
+    public int getRoiX() {
+        return roiX;
+    }
+
+    public int getRoiY() {
+        return roiY;
+    }
+
+    public int getRoiSize() {
+        return roiSize;
+    }
+
     public void close() {
         if (interpreter != null) {
             interpreter.close();
             interpreter = null;
+        }
+        if (gpuDelegate != null) {
+            gpuDelegate.close();
+            gpuDelegate = null;
         }
     }
 }
