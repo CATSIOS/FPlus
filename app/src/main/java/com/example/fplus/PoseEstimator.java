@@ -27,8 +27,12 @@ public class PoseEstimator {
     private static final String TAG = "PoseEstimator";
     private static final int INPUT_SIZE = 640;
     private static final float CONFIDENCE_THRESHOLD = 0.15f;
-    // 判定为「有效目标」的最低置信度：低于此值视为无人/误检，让黄圈回正
+    // 判定为「有效目标」的最低置信度：ByteTrack 高置信度检测阈值
     private static final float VALID_DETECTION_CONF = 0.2f;
+    // ByteTrack 低置信度检测阈值（第二阶段匹配），用于"救活"被遮挡/漏检但跟踪中的目标
+    private static final float BYTETRACK_LOW_CONF = 0.1f;
+    // 第二阶段（低置信度 + 已跟踪目标）的 IoU 匹配阈值，比正常更宽松，允许部分漏检
+    private static final float BYTETRACK_LOW_IOU = 0.1f;
     private static final float MIN_AREA_THRESHOLD = 0.01f;
     // 距离准星（屏幕中心）的高斯权重标准差（归一化，越大锁定范围越宽）
     private static final float CENTER_SIGMA = 0.2f;
@@ -80,6 +84,11 @@ public class PoseEstimator {
     private int trackLostFrames = 0;
     private static final int MAX_TRACK_LOST = 20;
     private static final float TRACK_IOU_THRESHOLD = 0.2f;
+    // OC-SORT OCM：跟踪目标的速度估计（像素/帧），用于匹配前按 lost 帧数做位置外推
+    private float trackVelX = 0f;
+    private float trackVelY = 0f;
+    private long lastTrackTimeNanos = 0L;
+    private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数
 
     // 分阶段计时统计
     private long preprocessAccum;
@@ -380,13 +389,34 @@ public class PoseEstimator {
     }
 
     private PersonPose parseOutput() {
+        int numPredictions = numAnchors;
+
+        // 收集 low conf 检测的 box（[px,py,pw,ph,conf]）用于 ByteTrack 第二阶段
+        float[][] lowBoxes = null;
+        int lowCount = 0;
+        // 提前分配一次性缓冲：最多 N 个 low（上限 anchors，实际少得多）
+        // 这里用一个动态的小列表，用数组避免 ArrayList 分配
+        int lowCap = 32;
+        lowBoxes = new float[lowCap][];
+
+        // ===== OC-SORT OCM：先对 trackedBox 做基于速度的位置外推 =====
+        // 用「预测后的 trackedBox」去跟检测框做匹配，解决突然移动（开镜）时 IoU 骤降断锁
+        float[] predTracked = trackedBox;
+        if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST) {
+            // lost 帧数作为预测步长；+1 代表当前帧再推一次
+            int steps = Math.min(trackLostFrames + 1, 5); // 上限 5 帧，避免外推过远
+            float pxC = trackedBox[0] + trackVelX * steps;
+            float pyC = trackedBox[1] + trackVelY * steps;
+            predTracked = new float[]{pxC, pyC, trackedBox[2], trackedBox[3]};
+        }
+
+        // ===== ByteTrack 第一阶段：高置信度（conf >= HIGH=VALID_DETECTION_CONF）正常评分 =====
         PersonPose bestPose = null;
         float maxScore = -1f;
         float bestConf = 0f;
-        int numPredictions = numAnchors;
+        boolean bestMatchedTrack = false;
 
         for (int i = 0; i < numPredictions; i++) {
-            // 取所有类别（channel 4 到 numChannels-1）的最大置信度
             float boxConf = 0;
             for (int c = 4; c < numChannels; c++) {
                 float conf = getOutputValue(c, i);
@@ -394,7 +424,8 @@ public class PoseEstimator {
                     boxConf = conf;
                 }
             }
-            if (boxConf < CONFIDENCE_THRESHOLD) {
+            // ByteTrack: 第一阶段阈值用 HIGH；低于 HIGH 但 >= LOW 暂存为候选项
+            if (boxConf < BYTETRACK_LOW_CONF) {
                 continue;
             }
 
@@ -403,55 +434,121 @@ public class PoseEstimator {
             float w = getOutputValue(2, i);
             float h = getOutputValue(3, i);
             float area = w * h;
-
             if (area < MIN_AREA_THRESHOLD) {
                 continue;
             }
 
-            // 映射到原图像素坐标，跟踪与 ROI 跟随都基于绝对坐标
             float px = cx * roiSize + roiX;
             float py = cy * roiSize + roiY;
             float pw = w * roiSize;
             float ph = h * roiSize;
-            float[] box = new float[]{px, py, pw, ph};
 
-            // 距离准星（屏幕中心）权重：高斯衰减，离准星越近越优先（主导因素）
-            float dx = (px - originalWidth / 2f) / originalWidth;
-            float dy = (py - originalHeight / 2f) / originalHeight;
-            float distToCenter = (float) Math.sqrt(dx * dx + dy * dy);
-            float distWeight = (float) Math.exp(-(distToCenter * distToCenter)
-                    / (2 * CENTER_SIGMA * CENTER_SIGMA));
+            if (boxConf >= VALID_DETECTION_CONF) {
+                // === HIGH 分支：参与综合评分选主目标 ===
+                float[] box = new float[]{px, py, pw, ph};
 
-            // 跟踪连续性：当前锁定目标加分，防止多目标间来回跳
-            float trackBonus = 1.0f;
-            if (trackedBox != null && boxIou(trackedBox, box) >= TRACK_IOU_THRESHOLD) {
-                trackBonus = TRACK_BONUS;
+                float dx = (px - originalWidth / 2f) / originalWidth;
+                float dy = (py - originalHeight / 2f) / originalHeight;
+                float distToCenter = (float) Math.sqrt(dx * dx + dy * dy);
+                float distWeight = (float) Math.exp(-(distToCenter * distToCenter)
+                        / (2 * CENTER_SIGMA * CENTER_SIGMA));
+
+                // 跟踪加分用"预测后的 trackedBox"做 IoU
+                float trackBonus = 1.0f;
+                boolean matched = predTracked != null
+                        && boxIou(predTracked, box) >= TRACK_IOU_THRESHOLD;
+                if (matched) {
+                    trackBonus = TRACK_BONUS;
+                }
+
+                float score = boxConf * distWeight * trackBonus;
+                if (score > maxScore) {
+                    maxScore = score;
+                    bestConf = boxConf;
+                    bestPose = new PersonPose();
+                    bestPose.box = box;
+                    bestMatchedTrack = matched;
+                }
+            } else {
+                // === LOW 分支（BYTETRACK_LOW_CONF <= conf < VALID_DETECTION_CONF）
+                // 暂存，第一阶段结束后专门用于「救活」被遮挡的已跟踪目标
+                if (lowCount >= lowCap) {
+                    // 扩容（极少触发）
+                    int newCap = lowCap * 2;
+                    float[][] newLow = new float[newCap][];
+                    System.arraycopy(lowBoxes, 0, newLow, 0, lowCap);
+                    lowBoxes = newLow;
+                    lowCap = newCap;
+                }
+                lowBoxes[lowCount++] = new float[]{px, py, pw, ph, boxConf};
             }
+        }
 
-            float score = boxConf * distWeight * trackBonus;
-
-            if (score > maxScore) {
-                maxScore = score;
-                bestConf = boxConf;
+        // ===== ByteTrack 第二阶段：如果已跟踪目标在 HIGH 阶段没匹配到，用 LOW 集合救援 =====
+        boolean rescuedByLow = false;
+        if (trackedBox != null && !bestMatchedTrack && lowCount > 0) {
+            float bestLowIoU = 0f;
+            float[] bestLowBox = null;
+            for (int i = 0; i < lowCount; i++) {
+                float[] lb = lowBoxes[i];
+                float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
+                float iou = boxIou(predTracked, lbBox);
+                // LOW 阶段 IoU 阈值更宽松（0.1），允许框质量差但位置大致对得上
+                if (iou >= BYTETRACK_LOW_IOU && iou > bestLowIoU) {
+                    bestLowIoU = iou;
+                    bestLowBox = lbBox;
+                }
+            }
+            if (bestLowBox != null) {
+                // 救援成功：把 LOW box 当作本次选中目标，替代 high 阶段的选择
+                // （只在 HIGH 没匹配到跟踪时才替换；若 HIGH 已选到一个 unrelated 高分框也替换，
+                //  避免「有人突然出现在画面边缘就被抢走锁定」）
                 bestPose = new PersonPose();
-                bestPose.box = box;
+                bestPose.box = bestLowBox;
+                bestConf = VALID_DETECTION_CONF; // 视为有效目标，避免下游判定无人
+                rescuedByLow = true;
+                bestMatchedTrack = true;
             }
         }
 
-        // 置信度不足时视为无有效目标，让黄圈回正（而非锁住误检）
-        if (bestPose != null && bestConf < VALID_DETECTION_CONF) {
+        // HIGH 阶段若已选到"非跟踪目标"的高分框（例如画面边缘另一个人突然出现），
+        // 但当前仍在锁定中，我们不应该抢走锁定。逻辑：在 trackedBox 仍有效（lostFrames 不大）
+        // 情况下，如果 bestMatchedTrack == false 说明 HIGH 选的不是当前目标，保持旧 trackedBox
+        if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack
+                && bestPose != null && !rescuedByLow) {
+            // 不接受这个新目标（把 bestPose 置空，交给 lost++ 逻辑，让跟踪继续沿用旧轨迹）
             bestPose = null;
+            bestConf = 0f;
         }
 
-        // 更新跟踪状态
+        // ===== 更新速度估计 & 跟踪状态 =====
+        long nowNanos = System.nanoTime();
         if (bestPose != null) {
+            // 用 dt 归一化再 EMA 更新速度
+            if (lastTrackTimeNanos != 0L && trackedBox != null) {
+                double dtSec = (nowNanos - lastTrackTimeNanos) / 1_000_000_000.0;
+                if (dtSec > 1e-6) {
+                    // 60fps 基准帧时长 (16.6ms) 做归一化
+                    double framesElapsed = dtSec / (1.0 / 60.0);
+                    if (framesElapsed < 0.5) framesElapsed = 0.5;
+                    float rawVx = (bestPose.box[0] - trackedBox[0]) / (float) framesElapsed;
+                    float rawVy = (bestPose.box[1] - trackedBox[1]) / (float) framesElapsed;
+                    trackVelX = (1 - VEL_EMA_ALPHA) * trackVelX + VEL_EMA_ALPHA * rawVx;
+                    trackVelY = (1 - VEL_EMA_ALPHA) * trackVelY + VEL_EMA_ALPHA * rawVy;
+                }
+            }
             trackedBox = bestPose.box.clone();
             trackLostFrames = 0;
+            lastTrackTimeNanos = nowNanos;
         } else if (trackedBox != null) {
             trackLostFrames++;
+            // lost 期间不更新速度估计，保持最后一次速度做外推
             if (trackLostFrames >= MAX_TRACK_LOST) {
                 trackedBox = null;
                 trackLostFrames = 0;
+                trackVelX = 0f;
+                trackVelY = 0f;
+                lastTrackTimeNanos = 0L;
             }
         }
 

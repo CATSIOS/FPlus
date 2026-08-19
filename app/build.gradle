@@ -27,6 +27,10 @@ android {
             }
         }
     }
+    aaptOptions {
+        // 禁止压缩 tflite 模型文件：避免加载时在内存解压，初始化更快、省额外内存拷贝
+        noCompress "tflite"
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11

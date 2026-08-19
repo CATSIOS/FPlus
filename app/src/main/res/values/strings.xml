@@ -3,7 +3,7 @@
     <string name="title_main">FPlus</string>
     <string name="subtitle_main">游戏人物锁定 · AI 视觉辅助</string>
     <string name="gpu_option_title">推理后端</string>
-    <string name="backend_npu">NPU 推理（最快）</string>
+    <string name="backend_npu">NPU 推理</string>
     <string name="backend_gpu">GPU 推理</string>
     <string name="backend_cpu">CPU 推理</string>
     <string name="model_option_title">模型</string>

@@ -263,7 +263,7 @@ public class MainActivity extends AppCompatActivity {
         if (MODEL_NHWC.equals(model)) return "640/NHWC";
         if (MODEL_INT8.equals(model)) return "640/INT8";
         if (MODEL_416.equals(model)) return "416";
-        return "640";
+        return "640/NCHW";
     }
 
     private String backendLabel(PoseEstimator.Backend backend) {
