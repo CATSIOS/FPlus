@@ -70,6 +70,11 @@ public class PoseEstimator {
     private FloatBuffer inputFloatBuffer;
     private float[] inputFloats;
     private int[] pixels;
+    // convert 零-copy 优化：copyPixelsToBuffer 一次 memcpy 拿 RGBA byte，跳过 getPixels 的 int 打包；
+    // brightLut 亮度查表（256 项），省每像素浮点乘加 clamp，遍历只做数组读
+    private byte[] pixelBytes;
+    private ByteBuffer pixelCopyBuffer;
+    private float[] brightLut;
     private Bitmap scaledRoi;
     private Canvas scaleCanvas;
     private Paint scalePaint;
@@ -313,6 +318,7 @@ public class PoseEstimator {
         BRIGHTNESS_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
         BRIGHTNESS_OFFSET = parseFloat(prefs, "bright_offset", 25f);
         BRIGHTNESS_OFFSET_NORM = BRIGHTNESS_OFFSET * INV_255;
+        rebuildBrightLut();  // 亮度参数变化后重建 LUT，convert 遍历用查表替代浮点乘加
         // 双实例并发 PoC 开关（"1"=开），zoom 比例
         DUAL_INFER_ENABLED = "1".equals(prefs.getString("dual_infer", "0"));
         DUAL_ZOOM = parseFloat(prefs, "dual_zoom", 0.5f);
@@ -614,36 +620,45 @@ public class PoseEstimator {
     }
 
     private void bitmapToByteBuffer(Bitmap bitmap) {
+        if (brightLut == null) rebuildBrightLut();  // 兜底：构造异常未初始化 LUT 时补建
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
         int len = width * height;
-        if (pixels == null || pixels.length != len) {
-            pixels = new int[len];
+        int byteLen = len * 4;
+        if (pixelBytes == null || pixelBytes.length != byteLen || pixelCopyBuffer == null) {
+            pixelBytes = new byte[byteLen];
+            pixelCopyBuffer = ByteBuffer.allocateDirect(byteLen);
+            pixelCopyBuffer.order(ByteOrder.nativeOrder());
         }
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
+        // copyPixelsToBuffer 一次 memcpy 拿 RGBA byte，跳过 getPixels 的逐像素 JNI int 打包
+        pixelCopyBuffer.rewind();
+        bitmap.copyPixelsToBuffer(pixelCopyBuffer);
+        pixelCopyBuffer.rewind();
+        pixelCopyBuffer.get(pixelBytes, 0, byteLen);
 
         int total = len * 3;
         if (inputFloats == null || inputFloats.length != total) {
             inputFloats = new float[total];
         }
 
-        // float32，值 [0, 1]（* 1/255），并做亮度/对比度增强
+        // float32，值 [0,1] 并做亮度增强：LUT 查表替代每像素浮点乘加 clamp
+        // copyPixelsToBuffer 对 ARGB_8888 输出 RGBA 字节序：byte[4i]=R, [4i+1]=G, [4i+2]=B, [4i+3]=A
         if (inputNchw) {
             // NCHW [1,3,H,W]：R 全图、G 全图、B 全图
             for (int i = 0; i < len; i++) {
-                int p = pixels[i];
-                inputFloats[i] = brighten(((p >> 16) & 0xFF) * INV_255);
-                inputFloats[len + i] = brighten(((p >> 8) & 0xFF) * INV_255);
-                inputFloats[len * 2 + i] = brighten((p & 0xFF) * INV_255);
+                int idx = i * 4;
+                inputFloats[i] = brightLut[pixelBytes[idx] & 0xFF];
+                inputFloats[len + i] = brightLut[pixelBytes[idx + 1] & 0xFF];
+                inputFloats[len * 2 + i] = brightLut[pixelBytes[idx + 2] & 0xFF];
             }
         } else {
             // NHWC [1,H,W,3]：逐像素 R,G,B 连续
             for (int i = 0; i < len; i++) {
-                int p = pixels[i];
+                int idx = i * 4;
                 int base = i * 3;
-                inputFloats[base] = brighten(((p >> 16) & 0xFF) * INV_255);
-                inputFloats[base + 1] = brighten(((p >> 8) & 0xFF) * INV_255);
-                inputFloats[base + 2] = brighten((p & 0xFF) * INV_255);
+                inputFloats[base] = brightLut[pixelBytes[idx] & 0xFF];
+                inputFloats[base + 1] = brightLut[pixelBytes[idx + 1] & 0xFF];
+                inputFloats[base + 2] = brightLut[pixelBytes[idx + 2] & 0xFF];
             }
         }
 
@@ -768,6 +783,20 @@ public class PoseEstimator {
             }
         }
         return best;
+    }
+
+    /** 重建亮度查表（GAIN/OFFSET 变化时调用）：brightLut[v]=clamp(v*INV_255*GAIN+OFFSET_NORM) */
+    private void rebuildBrightLut() {
+        if (brightLut == null || brightLut.length != 256) {
+            brightLut = new float[256];
+        }
+        for (int i = 0; i < 256; i++) {
+            float v = i * INV_255;
+            v = v * BRIGHTNESS_GAIN + BRIGHTNESS_OFFSET_NORM;
+            if (v < 0f) v = 0f;
+            else if (v > 1f) v = 1f;
+            brightLut[i] = v;
+        }
     }
 
     private float brighten(float v) {

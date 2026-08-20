@@ -71,6 +71,7 @@ public class ScreenCaptureService extends Service {
     private int captureBitmapIdx = 0;
     // 复用像素缓冲，避免每帧分配
     private int[] capturePixels;
+    private byte[] captureByteArray;  // bulk get 缓冲，跳过逐字节 buffer.get 的 JNI 开销
 
     // 帧耗时统计
     private long estimateTimeAccum;
@@ -289,15 +290,21 @@ public class ScreenCaptureService extends Service {
 
     private Bitmap imageToBitmap(Image image) {
         // 兜底：imageReader.close 后 image 的 DirectByteBuffer 可能变 inaccessible，
-        // 任何 buffer.get() 都会抛 IllegalStateException；此时返回 null 跳过该帧，避免崩溃
+        // bulk get 会抛 IllegalStateException；此时返回 null 跳过该帧，避免崩溃
         try {
             Image.Plane plane = image.getPlanes()[0];
             ByteBuffer buffer = plane.getBuffer();
             int pixelStride = plane.getPixelStride();
             int rowStride = plane.getRowStride();
-            int rowPadding = rowStride - pixelStride * captureWidth;
 
             buffer.rewind();
+            int totalBytes = rowStride * captureHeight;
+            if (captureByteArray == null || captureByteArray.length < totalBytes) {
+                captureByteArray = new byte[totalBytes];
+            }
+            // 一次 bulk get 拷整个 buffer 到 byte[]，跳过逐字节 buffer.get() 的 JNI 开销
+            buffer.get(captureByteArray, 0, totalBytes);
+
             int len = captureWidth * captureHeight;
             if (capturePixels == null || capturePixels.length != len) {
                 capturePixels = new int[len];
@@ -305,29 +312,28 @@ public class ScreenCaptureService extends Service {
             int[] pixels = capturePixels;
             int outIndex = 0;
 
+            // 遍历 byte[]（内存无 JNI），按 rowStride 步长提取 RGBA 打包成 ARGB int
             if (pixelStride == 4) {
                 for (int y = 0; y < captureHeight; y++) {
+                    int rowStart = y * rowStride;
                     for (int x = 0; x < captureWidth; x++) {
-                        int r = buffer.get() & 0xFF;
-                        int g = buffer.get() & 0xFF;
-                        int b = buffer.get() & 0xFF;
-                        int a = buffer.get() & 0xFF;
-                        pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
-                    }
-                    if (rowPadding > 0) {
-                        buffer.position(buffer.position() + rowPadding);
+                        int idx = rowStart + x * 4;
+                        int r = captureByteArray[idx] & 0xFF;
+                        int g = captureByteArray[idx + 1] & 0xFF;
+                        int b = captureByteArray[idx + 2] & 0xFF;
+                        pixels[outIndex++] = 0xFF000000 | (r << 16) | (g << 8) | b;
                     }
                 }
             } else {
+                // pixelStride != 4 兜底（罕见，保留兼容）
                 for (int y = 0; y < captureHeight; y++) {
                     int rowStart = y * rowStride;
                     for (int x = 0; x < captureWidth; x++) {
                         int index = rowStart + x * pixelStride;
-                        int r = buffer.get(index) & 0xFF;
-                        int g = buffer.get(index + 1) & 0xFF;
-                        int b = buffer.get(index + 2) & 0xFF;
-                        int a = buffer.get(index + 3) & 0xFF;
-                        pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
+                        int r = captureByteArray[index] & 0xFF;
+                        int g = captureByteArray[index + 1] & 0xFF;
+                        int b = captureByteArray[index + 2] & 0xFF;
+                        pixels[outIndex++] = 0xFF000000 | (r << 16) | (g << 8) | b;
                     }
                 }
             }
@@ -346,8 +352,8 @@ public class ScreenCaptureService extends Service {
             }
             bmp.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
             return bmp;
-        } catch (IllegalStateException e) {
-            // buffer 已不可访问（imageReader 被关闭），跳过该帧
+        } catch (Exception e) {
+            // buffer 不可访问（imageReader 关闭）或帧数据不完整（竞态），跳过该帧
             return null;
         }
     }
