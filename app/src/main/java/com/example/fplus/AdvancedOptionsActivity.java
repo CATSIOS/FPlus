@@ -10,6 +10,7 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -122,12 +123,13 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "二阶缓动保留比例（0~0.8）", GROUP_OVERLAY, 0, 0.8));
 
         params.add(new ParamItem("dual_infer", "0", "双实例并发",
-                "1=开启第二路放大区推理，榨GPU算力（0/1）", GROUP_DUAL, 0, 1));
+                "开启第二路放大区推理，榨GPU算力", GROUP_DUAL, 0, 1));
         params.add(new ParamItem("dual_zoom", "0.5", "放大区比例",
                 "第二路区域相对ROI（0.3~0.8，越小放大越大）", GROUP_DUAL, 0.3, 0.8));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();
+    private Switch dualSwitch;  // dual_infer 用开关控件，editTexts 对应槽位存 null 占位
     private SharedPreferences prefs;
 
     @Override
@@ -209,22 +211,33 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
 
             row.addView(textCol);
 
-            // 右侧 EditText
-            EditText et = new EditText(this);
-            et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
-            et.setMinEms(5);
-            et.setMaxEms(6);
-            et.setGravity(Gravity.CENTER);
-            // 读取当前值：prefs 无值则用默认
-            String cur = prefs.getString(p.key, p.defValue);
-            et.setText(cur);
-            LinearLayout.LayoutParams etLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT);
-            etLp.setMarginStart(dp(12));
-            row.addView(et, etLp);
-
-            editTexts.add(et);
+            // 右侧控件：dual_infer 用开关，其余用数值输入框
+            if ("dual_infer".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                dualSwitch = sw;
+                editTexts.add(null);  // 占位保持与 params index 对齐
+            } else {
+                EditText et = new EditText(this);
+                et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
+                et.setMinEms(5);
+                et.setMaxEms(6);
+                et.setGravity(Gravity.CENTER);
+                // 读取当前值：prefs 无值则用默认
+                String cur = prefs.getString(p.key, p.defValue);
+                et.setText(cur);
+                LinearLayout.LayoutParams etLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                etLp.setMarginStart(dp(12));
+                row.addView(et, etLp);
+                editTexts.add(et);
+            }
 
             LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -240,6 +253,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         List<String> resetNames = new ArrayList<>();
         for (int i = 0; i < params.size(); i++) {
             ParamItem p = params.get(i);
+            if ("dual_infer".equals(p.key)) {
+                editor.putString(p.key, dualSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
             String val = editTexts.get(i).getText().toString().trim();
             String saved = val;
             if (val.isEmpty()) {
@@ -278,6 +295,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         editor.apply();
         // 刷新 UI 显示默认值
         for (int i = 0; i < params.size(); i++) {
+            if ("dual_infer".equals(params.get(i).key)) {
+                dualSwitch.setChecked("1".equals(params.get(i).defValue));
+                continue;
+            }
             editTexts.get(i).setText(params.get(i).defValue);
         }
         Toast.makeText(this, "已恢复默认值", Toast.LENGTH_SHORT).show();
