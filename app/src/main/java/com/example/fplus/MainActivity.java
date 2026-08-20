@@ -83,9 +83,19 @@ public class MainActivity extends AppCompatActivity {
         Button btnBenchmark = findViewById(R.id.btn_benchmark);
         btnBenchmark.setOnClickListener(v -> runBenchmark());
 
+        Button btnAdvanced = findViewById(R.id.btn_advanced);
+        btnAdvanced.setOnClickListener(v -> {
+            Intent intent = new Intent(this, AdvancedOptionsActivity.class);
+            startActivity(intent);
+        });
+
         Button btnStart = findViewById(R.id.btn_start);
         btnStart.setOnClickListener(v -> {
-            if (checkOverlayPermission()) {
+            // 再次按下"开始"时若服务在运行则停止（toggle 行为）
+            if (ScreenCaptureService.getInstance() != null) {
+                stopService(new Intent(this, ScreenCaptureService.class));
+                btnStart.setText(R.string.btn_start);
+            } else if (checkOverlayPermission()) {
                 requestScreenCapture();
             } else {
                 requestOverlayPermission();
@@ -153,6 +163,8 @@ public class MainActivity extends AppCompatActivity {
             startService(serviceIntent);
         }
         Toast.makeText(this, "服务已启动", Toast.LENGTH_SHORT).show();
+        Button btnStart = findViewById(R.id.btn_start);
+        btnStart.setText(R.string.btn_stop);
     }
 
     /**

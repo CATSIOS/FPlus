@@ -30,6 +30,13 @@
             </intent-filter>
         </activity>
 
+        <!-- 高级选项 Activity -->
+        <activity
+            android:name=".AdvancedOptionsActivity"
+            android:label="@string/advanced_title"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <!-- 屏幕捕获前台服务 -->
         <service
             android:name=".ScreenCaptureService"

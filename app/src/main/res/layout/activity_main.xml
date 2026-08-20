@@ -112,6 +112,12 @@
             </RadioGroup>
         </LinearLayout>
 
+        <!-- 中间竖直分割线 -->
+        <View
+            android:layout_width="1dp"
+            android:layout_height="match_parent"
+            android:background="#1AFFFFFF" />
+
         <!-- 右侧：测速结果与操作 -->
         <LinearLayout
             android:layout_width="0dp"
@@ -134,7 +140,7 @@
                     android:textSize="12sp" />
             </ScrollView>
 
-            <com.google.android.material.button.MaterialButton
+            <Button
                 android:id="@+id/btn_benchmark"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -142,7 +148,15 @@
                 android:text="@string/btn_benchmark"
                 android:textSize="14sp" />
 
-            <com.google.android.material.button.MaterialButton
+            <Button
+                android:id="@+id/btn_advanced"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/btn_advanced"
+                android:textSize="14sp" />
+
+            <Button
                 android:id="@+id/btn_start"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

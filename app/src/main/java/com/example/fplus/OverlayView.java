@@ -1,13 +1,16 @@
 package com.example.fplus;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.util.Log;
 import android.view.View;
 
 public class OverlayView extends View {
 
+    private static final String TAG = "OverlayView";
     private Paint boxPaint;
     private Paint roiPaint;
 
@@ -18,10 +21,11 @@ public class OverlayView extends View {
     private OneEuroFilter filterY;
 
     // 1€ 滤波器参数：最小截止频率（Hz，静止平滑度）与速度系数（快速移动响应度）
-    private static final double MIN_CUTOFF = 1.5;
-    private static final double BETA = 5.0;
+    // 可调参数（从 SharedPreferences 读取，详见 AdvancedOptionsActivity）
+    private double MIN_CUTOFF = 2.5;
+    private double BETA = 8.0;
     // 跳变阈值：位移超过该值视为目标切换/误检，限制最大移动量，避免框瞬移
-    private static final float MAX_JUMP = 0.2f;
+    private float MAX_JUMP = 0.4f;
     // 尺寸平滑系数
     private static final float SIZE_SMOOTH = 0.6f;
 
@@ -40,8 +44,35 @@ public class OverlayView extends View {
 
     public OverlayView(Context context) {
         super(context);
+        loadPrefs(context);
         initPaints();
         setWillNotDraw(false);
+    }
+
+    /**
+     * 从 SharedPreferences 读取高级参数，无值则保留默认
+     */
+    private void loadPrefs(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences("fplus_settings", Context.MODE_PRIVATE);
+        // 每个参数单独 try-catch：避免一个坏值连累其他参数丢失配置
+        try {
+            MIN_CUTOFF = Double.parseDouble(prefs.getString("overlay_min_cutoff", "2.5"));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "overlay_min_cutoff 解析失败，使用默认 2.5");
+            MIN_CUTOFF = 2.5;
+        }
+        try {
+            BETA = Double.parseDouble(prefs.getString("overlay_beta", "8.0"));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "overlay_beta 解析失败，使用默认 8.0");
+            BETA = 8.0;
+        }
+        try {
+            MAX_JUMP = Float.parseFloat(prefs.getString("overlay_max_jump", "0.4"));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "overlay_max_jump 解析失败，使用默认 0.4");
+            MAX_JUMP = 0.4f;
+        }
     }
 
     private void initPaints() {

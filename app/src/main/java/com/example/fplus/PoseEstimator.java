@@ -1,6 +1,7 @@
 package com.example.fplus;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -26,36 +27,37 @@ public class PoseEstimator {
 
     private static final String TAG = "PoseEstimator";
     private static final int INPUT_SIZE = 640;
-    private static final float CONFIDENCE_THRESHOLD = 0.15f;
+    // 可调参数（从 SharedPreferences 读取，详见 AdvancedOptionsActivity）
+    private float CONFIDENCE_THRESHOLD = 0.15f;
     // 判定为「有效目标」的最低置信度：ByteTrack 高置信度检测阈值
-    private static final float VALID_DETECTION_CONF = 0.2f;
+    private float VALID_DETECTION_CONF = 0.2f;
     // ByteTrack 低置信度检测阈值（第二阶段匹配），用于"救活"被遮挡/漏检但跟踪中的目标
     private static final float BYTETRACK_LOW_CONF = 0.1f;
     // 第二阶段（低置信度 + 已跟踪目标）的 IoU 匹配阈值，比正常更宽松，允许部分漏检
     private static final float BYTETRACK_LOW_IOU = -0.05f;
-    private static final float MIN_AREA_THRESHOLD = 0.01f;
+    private float MIN_AREA_THRESHOLD = 0.01f;
     // 距离准星（屏幕中心）的高斯权重标准差（归一化，越大锁定范围越宽）
-    private static final float CENTER_SIGMA = 0.2f;
+    private float CENTER_SIGMA = 0.2f;
     // 方案3：水平偏心角度分数（FPS 横向瞄准是关键，垂直偏心不惩罚）
     // 借鉴 Best Target Selection (Nicholas Gorski) 的"距离+角度"组合评分
     private static final float ANGLE_SIGMA = 0.25f;
     // 评分组合权重：score = (1-W)*distWeight + W*angleWeight
-    private static final float SCORE_W = 0.3f;
+    private float SCORE_W = 0.3f;
     // 当前锁定目标的连续性加成倍数（防止多目标间来回跳）
     private static final float TRACK_BONUS = 2.0f;
     // 接管阈值：新目标置信度 ≥ 此值时绕过 anti-lock-jump 保护，立即切换锁定
     // 解决「人物突然入场」场景下被压制 MAX_TRACK_LOST 帧导致的 ~0.5s 延迟
     // 远处小目标置信度通常 < 0.5，仍受保护；清晰人物入场 > 0.5 可即时响应
-    private static final float TAKEOVER_CONF = 0.5f;
+    private float TAKEOVER_CONF = 0.5f;
     // ROI（黄框）占短边的比例，缩小让识别区域更聚焦中心
-    private static final float ROI_SCALE = 0.7f;
+    private float ROI_SCALE = 0.7f;
     // 目标丢失时 ROI 回中的平滑系数（每帧移动剩余距离的比例）
     private static final float RECENTER_SMOOTH = 0.2f;
     private static final float INV_255 = 1f / 255f;
     // 亮度/对比度增强：游戏场景偏暗，提亮有助于提升检测率
-    private static final float BRIGHTNESS_GAIN = 1.3f;   // 对比度增益
-    private static final float BRIGHTNESS_OFFSET = 25f;  // 亮度偏移（0~255）
-    private static final float BRIGHTNESS_OFFSET_NORM = BRIGHTNESS_OFFSET * INV_255;
+    private float BRIGHTNESS_GAIN = 1.3f;   // 对比度增益
+    private float BRIGHTNESS_OFFSET = 25f;  // 亮度偏移（0~255）
+    private float BRIGHTNESS_OFFSET_NORM;  // 派生：构造时从 BRIGHTNESS_OFFSET 计算
 
     private Interpreter interpreter;
     private GpuDelegate gpuDelegate;
@@ -94,8 +96,8 @@ public class PoseEstimator {
     // TRACK_BUFFER：跟踪丢失保留窗口，30fps 下 30 帧 ≈ 1 秒缓冲
     // 论文默认 60 帧（≈2秒），但游戏场景目标短暂出框/被遮挡后通常 1 秒内回归
     // 过短（原 20 帧=0.67 秒）会导致目标短暂闪身后回来重新锁定慢
-    private static final int MAX_TRACK_LOST = 30;
-    private static final float TRACK_IOU_THRESHOLD = 0.1f;
+    private int MAX_TRACK_LOST = 30;
+    private float TRACK_IOU_THRESHOLD = 0.1f;
     // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
     // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
     private static final float EXPAND_RATIO = 0.15f;
@@ -115,7 +117,7 @@ public class PoseEstimator {
     //   - Aimmy 默认 0.10s，Mvsd-scripts 默认 3 帧（60fps≈50ms）
     //   - FPlus 移动端 30fps，0.083s ≈ 2.5 帧抵消端到端延迟
     //   - 仍慢可调到 0.10s，跑过头（急转时绿框冲过）可降到 0.067s
-    private static final float PREDICT_SECONDS = 0.083f;
+    private float PREDICT_SECONDS = 0.083f;
     // MIN_VEL：速度低于此值视为静止，不外推（避免静止时绿框漂移）
     //   - trackVelX 单位为 60fps 基准每帧位移，0.001 相当于 60fps 下 0.1% 图像宽/帧
     private static final float MIN_VEL = 0.001f;
@@ -142,6 +144,7 @@ public class PoseEstimator {
     }
 
     public PoseEstimator(Context context, String modelName, Backend preferred) throws IOException {
+        loadPrefs(context);
         MappedByteBuffer modelBuffer = loadModelFile(context, modelName);
 
         // 按优先级逐次回退：NPU → GPU → CPU，从用户首选开始
@@ -209,6 +212,46 @@ public class PoseEstimator {
         inputBuffer.order(ByteOrder.nativeOrder());
         inputBuffer.rewind();
         inputFloatBuffer = inputBuffer.asFloatBuffer();
+    }
+
+    /**
+     * 从 SharedPreferences 读取高级参数，无值则保留默认
+     * key 与 AdvancedOptionsActivity 中定义一致
+     */
+    private void loadPrefs(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences("fplus_settings", Context.MODE_PRIVATE);
+        // 每个参数单独 try-catch：避免一个坏值连累后续所有合法参数丢失用户配置
+        CONFIDENCE_THRESHOLD = parseFloat(prefs, "det_conf", 0.15f);
+        VALID_DETECTION_CONF = parseFloat(prefs, "det_valid", 0.2f);
+        MIN_AREA_THRESHOLD = parseFloat(prefs, "det_min_area", 0.01f);
+        TRACK_IOU_THRESHOLD = parseFloat(prefs, "track_iou", 0.1f);
+        MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
+        TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
+        PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f);
+        CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f);
+        SCORE_W = parseFloat(prefs, "score_w", 0.3f);
+        ROI_SCALE = parseFloat(prefs, "roi_scale", 0.7f);
+        BRIGHTNESS_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
+        BRIGHTNESS_OFFSET = parseFloat(prefs, "bright_offset", 25f);
+        BRIGHTNESS_OFFSET_NORM = BRIGHTNESS_OFFSET * INV_255;
+    }
+
+    private float parseFloat(SharedPreferences prefs, String key, float def) {
+        try {
+            return Float.parseFloat(prefs.getString(key, Float.toString(def)));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "参数 " + key + " 解析失败，使用默认值 " + def);
+            return def;
+        }
+    }
+
+    private int parseInt(SharedPreferences prefs, String key, int def) {
+        try {
+            return Integer.parseInt(prefs.getString(key, Integer.toString(def)));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "参数 " + key + " 解析失败，使用默认值 " + def);
+            return def;
+        }
     }
 
     private static Backend[] fallbackOrder(Backend preferred) {
@@ -429,9 +472,13 @@ public class PoseEstimator {
         inputBuffer.rewind();
     }
 
-    private static float brighten(float v) {
+    private float brighten(float v) {
         v = v * BRIGHTNESS_GAIN + BRIGHTNESS_OFFSET_NORM;
-        return v < 1f ? v : 1f;
+        // clamp 到 [0,1]：用户在高级选项可能输入负 BRIGHTNESS_OFFSET，
+        // 不 clamp 下界会让模型输入出现负值，产生异常输出
+        if (v < 0f) return 0f;
+        if (v > 1f) return 1f;
+        return v;
     }
 
     private float getOutputValue(int channel, int anchor) {

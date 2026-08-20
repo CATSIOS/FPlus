@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">FPlus</string>
     <string name="title_main">FPlus</string>
-    <string name="subtitle_main">游戏人物锁定 · AI 视觉辅助</string>
+    <string name="subtitle_main">YOLO人物检测</string>
     <string name="gpu_option_title">推理后端</string>
     <string name="backend_npu">NPU 推理</string>
     <string name="backend_gpu">GPU 推理</string>
@@ -12,6 +12,11 @@
     <string name="model_int8">640 输入（INT8 量化）</string>
     <string name="model_416">416 输入</string>
     <string name="btn_start">开始</string>
+    <string name="btn_stop">停止</string>
     <string name="btn_benchmark">自动测速</string>
     <string name="benchmark_placeholder">尚未测速</string>
+    <string name="btn_advanced">高级选项</string>
+    <string name="advanced_title">高级选项</string>
+    <string name="btn_reset">一键还原</string>
+    <string name="btn_save">保存</string>
 </resources>

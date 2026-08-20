@@ -191,20 +191,33 @@ public class ScreenCaptureService extends Service {
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         imageReader.setOnImageAvailableListener(reader -> {
-            Image image = reader.acquireLatestImage();
-            if (image != null) {
+            // 停止中或 reader 已关闭：直接返回，避免在已 close 的 reader 上 acquire 抛 IllegalStateException
+            if (!isCapturing) return;
+            Image image;
+            try {
+                image = reader.acquireLatestImage();
+            } catch (IllegalStateException e) {
+                return;
+            }
+            if (image == null) return;
+            try {
                 Bitmap frame = imageToBitmap(image);
-                image.close();
-                if (frame != null && poseEstimator != null) {
+                final PoseEstimator estimator = poseEstimator;
+                if (frame != null && estimator != null) {
                     // 推理忙则丢帧（保持低延迟，不积压旧帧）
                     if (inferenceBusy.compareAndSet(false, true)) {
                         final Bitmap fFrame = frame;
                         inferenceHandler.post(() -> {
-                            processFrame(fFrame);
-                            inferenceBusy.set(false);
+                            try {
+                                processFrame(fFrame);
+                            } finally {
+                                inferenceBusy.set(false);
+                            }
                         });
                     }
                 }
+            } finally {
+                try { image.close(); } catch (IllegalStateException ignored) {}
             }
         }, captureHandler);
 
@@ -213,8 +226,22 @@ public class ScreenCaptureService extends Service {
     }
 
     private void processFrame(Bitmap frame) {
+        // 停止中：直接返回，避免 onDestroy 并发 null 字段时 NPE
+        if (!isCapturing) return;
+        // 局部引用：onDestroy 可能在 estimate 期间并发 null 化字段
+        final PoseEstimator estimator = poseEstimator;
+        final OverlayView view = overlayView;
+        if (estimator == null) return;
+
         long t0 = System.nanoTime();
-        PoseEstimator.PersonPose pose = poseEstimator.estimate(frame);
+        PoseEstimator.PersonPose pose;
+        try {
+            pose = estimator.estimate(frame);
+        } catch (Exception e) {
+            // estimator 可能正在被 close，吞掉异常退出
+            Log.w(TAG, "estimate interrupted during teardown", e);
+            return;
+        }
         long detectTime = System.nanoTime(); // 检测完成时间戳
         long elapsed = detectTime - t0;
         int frameWidth = frame.getWidth();
@@ -231,17 +258,27 @@ public class ScreenCaptureService extends Service {
             estimateTimeAccum = 0;
         }
 
-        if (overlayView != null) {
-            int roiX = poseEstimator.getRoiX();
-            int roiY = poseEstimator.getRoiY();
-            int roiSize = poseEstimator.getRoiSize();
+        if (view != null) {
+            int roiX = estimator.getRoiX();
+            int roiY = estimator.getRoiY();
+            int roiSize = estimator.getRoiSize();
             // pose 为 null 也要调用，让 OverlayView 的丢失/衰减逻辑生效
             float[] box = (pose != null && pose.box != null) ? pose.box.clone() : null;
             int w = frameWidth;
             int h = frameHeight;
             final float[] fBox = box;
             final long fTime = detectTime;
-            mainHandler.post(() -> overlayView.updateDetection(fBox, w, h, roiX, roiY, roiSize, fTime));
+            final int fRoiX = roiX, fRoiY = roiY, fRoiSize = roiSize;
+            final OverlayView fView = view;
+            // 局部引用 fView 不会被并发 null 化，lambda 安全
+            mainHandler.post(() -> {
+                if (!isCapturing) return;
+                try {
+                    fView.updateDetection(fBox, w, h, fRoiX, fRoiY, fRoiSize, fTime);
+                } catch (Exception ignored) {
+                    // view 已被 removeView，忽略
+                }
+            });
         }
     }
 
@@ -251,61 +288,68 @@ public class ScreenCaptureService extends Service {
     }
 
     private Bitmap imageToBitmap(Image image) {
-        Image.Plane plane = image.getPlanes()[0];
-        ByteBuffer buffer = plane.getBuffer();
-        int pixelStride = plane.getPixelStride();
-        int rowStride = plane.getRowStride();
-        int rowPadding = rowStride - pixelStride * captureWidth;
+        // 兜底：imageReader.close 后 image 的 DirectByteBuffer 可能变 inaccessible，
+        // 任何 buffer.get() 都会抛 IllegalStateException；此时返回 null 跳过该帧，避免崩溃
+        try {
+            Image.Plane plane = image.getPlanes()[0];
+            ByteBuffer buffer = plane.getBuffer();
+            int pixelStride = plane.getPixelStride();
+            int rowStride = plane.getRowStride();
+            int rowPadding = rowStride - pixelStride * captureWidth;
 
-        buffer.rewind();
-        int len = captureWidth * captureHeight;
-        if (capturePixels == null || capturePixels.length != len) {
-            capturePixels = new int[len];
-        }
-        int[] pixels = capturePixels;
-        int outIndex = 0;
+            buffer.rewind();
+            int len = captureWidth * captureHeight;
+            if (capturePixels == null || capturePixels.length != len) {
+                capturePixels = new int[len];
+            }
+            int[] pixels = capturePixels;
+            int outIndex = 0;
 
-        if (pixelStride == 4) {
-            for (int y = 0; y < captureHeight; y++) {
-                for (int x = 0; x < captureWidth; x++) {
-                    int r = buffer.get() & 0xFF;
-                    int g = buffer.get() & 0xFF;
-                    int b = buffer.get() & 0xFF;
-                    int a = buffer.get() & 0xFF;
-                    pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
+            if (pixelStride == 4) {
+                for (int y = 0; y < captureHeight; y++) {
+                    for (int x = 0; x < captureWidth; x++) {
+                        int r = buffer.get() & 0xFF;
+                        int g = buffer.get() & 0xFF;
+                        int b = buffer.get() & 0xFF;
+                        int a = buffer.get() & 0xFF;
+                        pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
+                    if (rowPadding > 0) {
+                        buffer.position(buffer.position() + rowPadding);
+                    }
                 }
-                if (rowPadding > 0) {
-                    buffer.position(buffer.position() + rowPadding);
+            } else {
+                for (int y = 0; y < captureHeight; y++) {
+                    int rowStart = y * rowStride;
+                    for (int x = 0; x < captureWidth; x++) {
+                        int index = rowStart + x * pixelStride;
+                        int r = buffer.get(index) & 0xFF;
+                        int g = buffer.get(index + 1) & 0xFF;
+                        int b = buffer.get(index + 2) & 0xFF;
+                        int a = buffer.get(index + 3) & 0xFF;
+                        pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
                 }
             }
-        } else {
-            for (int y = 0; y < captureHeight; y++) {
-                int rowStart = y * rowStride;
-                for (int x = 0; x < captureWidth; x++) {
-                    int index = rowStart + x * pixelStride;
-                    int r = buffer.get(index) & 0xFF;
-                    int g = buffer.get(index + 1) & 0xFF;
-                    int b = buffer.get(index + 2) & 0xFF;
-                    int a = buffer.get(index + 3) & 0xFF;
-                    pixels[outIndex++] = (a << 24) | (r << 16) | (g << 8) | b;
-                }
-            }
-        }
 
-        // 双缓冲：交替返回 bitmap A/B，连续两帧返回不同实例
-        // Inference 读上一帧的 3~5ms 远小于两帧间隔（~32ms），无读写冲突
-        int idx = captureBitmapIdx;
-        captureBitmapIdx = (idx + 1) % 2;
-        Bitmap bmp = captureBitmaps[idx];
-        if (bmp == null
-                || bmp.getWidth() != captureWidth
-                || bmp.getHeight() != captureHeight) {
-            if (bmp != null) bmp.recycle();
-            bmp = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
-            captureBitmaps[idx] = bmp;
+            // 双缓冲：交替返回 bitmap A/B，连续两帧返回不同实例
+            // Inference 读上一帧的 3~5ms 远小于两帧间隔（~32ms），无读写冲突
+            int idx = captureBitmapIdx;
+            captureBitmapIdx = (idx + 1) % 2;
+            Bitmap bmp = captureBitmaps[idx];
+            if (bmp == null
+                    || bmp.getWidth() != captureWidth
+                    || bmp.getHeight() != captureHeight) {
+                if (bmp != null) bmp.recycle();
+                bmp = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
+                captureBitmaps[idx] = bmp;
+            }
+            bmp.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
+            return bmp;
+        } catch (IllegalStateException e) {
+            // buffer 已不可访问（imageReader 被关闭），跳过该帧
+            return null;
         }
-        bmp.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
-        return bmp;
     }
 
     private void addOverlayView() {
@@ -353,41 +397,98 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        // 1. 先置停止标志，让 listener / processFrame 快速短路退出
         isCapturing = false;
+
+        // 2. 先注销 projectionCallback，避免 mediaProjection.stop() 触发 stopSelf 重入
         if (mediaProjection != null && projectionCallback != null) {
-            mediaProjection.unregisterCallback(projectionCallback);
+            try {
+                mediaProjection.unregisterCallback(projectionCallback);
+            } catch (Exception ignored) {}
             projectionCallback = null;
         }
+
+        // 3. 清空 imageReader 监听器，确保 captureThread 上不再有「新」回调入队
+        //    （已在队列中或正在执行的不受影响，需要靠下面 join 等待其完成）
+        if (imageReader != null) {
+            try {
+                imageReader.setOnImageAvailableListener(null, null);
+            } catch (Exception ignored) {}
+        }
+
+        // 4. 先退出 captureThread 并 join 等待当前正在执行的 imageToBitmap 完成，
+        //    必须在 imageReader.close() 之前——否则 image 的 DirectByteBuffer 会被释放，
+        //    导致正在跑的 imageToBitmap 内 buffer.get() 抛 IllegalStateException: buffer is inaccessible
+        if (captureThread != null) {
+            captureThread.quitSafely();
+            try { captureThread.join(500); } catch (InterruptedException ignored) {}
+            captureThread = null;
+            captureHandler = null;
+        }
+
+        // 5. captureThread 已停止，此时安全释放 VirtualDisplay / ImageReader / MediaProjection
         if (virtualDisplay != null) {
-            virtualDisplay.release();
+            try { virtualDisplay.release(); } catch (Exception ignored) {}
             virtualDisplay = null;
         }
         if (imageReader != null) {
-            imageReader.close();
+            try { imageReader.close(); } catch (Exception ignored) {}
             imageReader = null;
         }
         if (mediaProjection != null) {
-            mediaProjection.stop();
+            try { mediaProjection.stop(); } catch (Exception ignored) {}
             mediaProjection = null;
         }
-        if (captureThread != null) {
-            captureThread.quitSafely();
-            captureThread = null;
-        }
+
+        // 6. 捕获需要释放的对象引用并立即清空字段引用，
+        //    这样若 onDestroy 期间 onStartCommand 重入，新启动创建的对象不会被旧清理误释放
+        final PoseEstimator estimatorToClose = poseEstimator;
+        final Bitmap bmp0 = captureBitmaps[0];
+        final Bitmap bmp1 = captureBitmaps[1];
+        poseEstimator = null;
+        captureBitmaps[0] = null;
+        captureBitmaps[1] = null;
+
+        // 7. 把 estimator.close() / bitmap.recycle() 排到 inferenceThread 队列末尾执行，
+        //    quitSafely 会让当前正在跑的 processFrame 完成后顺序执行清理任务再退出，
+        //    既保证单线程安全释放，又不阻塞主线程（避免 join 引发 ANR 与超时竞态崩溃）
         if (inferenceThread != null) {
+            final Handler ih = inferenceHandler;
+            boolean posted = false;
+            if (ih != null) {
+                try {
+                    ih.post(() -> {
+                        if (estimatorToClose != null) {
+                            try { estimatorToClose.close(); } catch (Exception ignored) {}
+                        }
+                        if (bmp0 != null) try { bmp0.recycle(); } catch (Exception ignored) {}
+                        if (bmp1 != null) try { bmp1.recycle(); } catch (Exception ignored) {}
+                    });
+                    posted = true;
+                } catch (IllegalStateException ignored) {
+                    // looper 已退出，回退到同步清理
+                }
+            }
             inferenceThread.quitSafely();
             inferenceThread = null;
-        }
-        if (poseEstimator != null) {
-            poseEstimator.close();
-            poseEstimator = null;
-        }
-        for (int i = 0; i < captureBitmaps.length; i++) {
-            if (captureBitmaps[i] != null) {
-                captureBitmaps[i].recycle();
-                captureBitmaps[i] = null;
+            inferenceHandler = null;
+            if (!posted) {
+                // 无 looper 可用，同步清理
+                if (estimatorToClose != null) {
+                    try { estimatorToClose.close(); } catch (Exception ignored) {}
+                }
+                if (bmp0 != null) try { bmp0.recycle(); } catch (Exception ignored) {}
+                if (bmp1 != null) try { bmp1.recycle(); } catch (Exception ignored) {}
             }
+        } else {
+            // 无 inferenceThread，直接同步清理
+            if (estimatorToClose != null) {
+                try { estimatorToClose.close(); } catch (Exception ignored) {}
+            }
+            if (bmp0 != null) try { bmp0.recycle(); } catch (Exception ignored) {}
+            if (bmp1 != null) try { bmp1.recycle(); } catch (Exception ignored) {}
         }
+
         removeOverlayView();
         instance = null;
     }
