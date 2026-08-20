@@ -78,6 +78,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "LOW 救援 buffered IoU 阈值（0~1）", GROUP_TRACKING, 0, 1));
         params.add(new ParamItem("track_buf_low", "0.5", "C-BIoU LOW 缓冲",
                 "LOW 救援 buffer 扩展比例（0~1）", GROUP_TRACKING, 0, 1));
+        params.add(new ParamItem("track_speed_ref", "0.25", "速度自适应参考",
+                "HIGH buffer 放大触发速度（0.1~0.6 框宽/帧）", GROUP_TRACKING, 0.1, 0.6));
         params.add(new ParamItem("track_max_lost", "30", "最大跟踪丢失帧数",
                 "锁定保持时长（5~60 帧）", GROUP_TRACKING, 5, 60));
         params.add(new ParamItem("track_takeover", "0.5", "接管置信度",
@@ -85,6 +87,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
 
         params.add(new ParamItem("pred_seconds", "0.083", "预测时长（秒）",
                 "绿框提前量，抵消延迟（0~0.2）", GROUP_PREDICT, 0, 0.2));
+        params.add(new ParamItem("coast_min_vel", "0.01", "Coast 速度阈值",
+                "低于此速度不外推直接淡出（0.001~0.02）", GROUP_PREDICT, 0.001, 0.02));
+        params.add(new ParamItem("coast_max_frames", "2", "Coast 最大帧数",
+                "丢失外推持续上限（1~30 帧）", GROUP_PREDICT, 1, 30));
 
         params.add(new ParamItem("score_center_sigma", "0.2", "中心高斯标准差",
                 "锁定范围（0.1~0.5）", GROUP_SCORE, 0.1, 0.5));
@@ -107,6 +113,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "目标切换位移限制（0.1~1.0）", GROUP_OVERLAY, 0.1, 1.0));
         params.add(new ParamItem("overlay_size_smooth", "0.45", "尺寸平滑系数",
                 "越小越稳（0~1）", GROUP_OVERLAY, 0, 1));
+        params.add(new ParamItem("overlay_ease", "0.4", "ease 慢快慢",
+                "二阶缓动保留比例（0~0.8）", GROUP_OVERLAY, 0, 0.8));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();

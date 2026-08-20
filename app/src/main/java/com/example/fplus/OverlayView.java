@@ -28,11 +28,15 @@ public class OverlayView extends View {
     private float MAX_JUMP = 0.4f;
     // 尺寸平滑系数：越小越平滑（0=完全锁死尺寸，1=不平滑）
     private float SIZE_SMOOTH = 0.45f;
+    // 二阶 ease（慢快慢）：一阶 1€ 输出后再串一层 EMA，二阶低通阶跃响应为 S 形
+    // （慢起→快中→慢收 = ease-in-out），比纯 1€ 的"快起慢收"更丝滑
+    // EASE_KEEP 为二阶保留比例：0=关闭（纯一阶行为），越大越平滑但延迟增加
+    private float EASE_KEEP = 0.4f;
 
     // 检测丢失后的淡出透明度（255=不透明，0=消失）
     private int fadeAlpha = 255;
     // 丢失后淡出时长（纳秒）：固定 100ms 内完全消失，避免绿框原地滞留
-    private static final long FADE_DURATION_NANOS = 100_000_000L;
+    private static final long FADE_DURATION_NANOS = 50_000_000L;
     // 首次丢失帧的时间戳，用于按真实时长而非帧数淡出
     private long lostAtNanos = 0;
 
@@ -56,10 +60,10 @@ public class OverlayView extends View {
         SharedPreferences prefs = context.getSharedPreferences("fplus_settings", Context.MODE_PRIVATE);
         // 每个参数单独 try-catch：避免一个坏值连累其他参数丢失配置
         try {
-            MIN_CUTOFF = Double.parseDouble(prefs.getString("overlay_min_cutoff", "2.5"));
+            MIN_CUTOFF = Double.parseDouble(prefs.getString("overlay_min_cutoff", "2.0"));
         } catch (NumberFormatException e) {
-            Log.w(TAG, "overlay_min_cutoff 解析失败，使用默认 2.5");
-            MIN_CUTOFF = 2.5;
+            Log.w(TAG, "overlay_min_cutoff 解析失败，使用默认 2.0");
+            MIN_CUTOFF = 2.0;
         }
         try {
             BETA = Double.parseDouble(prefs.getString("overlay_beta", "8.0"));
@@ -78,6 +82,12 @@ public class OverlayView extends View {
         } catch (NumberFormatException e) {
             Log.w(TAG, "overlay_size_smooth 解析失败，使用默认 0.45");
             SIZE_SMOOTH = 0.45f;
+        }
+        try {
+            EASE_KEEP = Float.parseFloat(prefs.getString("overlay_ease", "0.4"));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "overlay_ease 解析失败，使用默认 0.4");
+            EASE_KEEP = 0.4f;
         }
     }
 
@@ -156,9 +166,13 @@ public class OverlayView extends View {
                 targetCy = displayBox[1] + dcy * scale;
             }
 
-            // 1€ 滤波器平滑中心（自适应：静止强平滑滤抖、快速移动弱平滑跟手）
-            displayBox[0] = (float) filterX.filter(targetCx, timestampNanos);
-            displayBox[1] = (float) filterY.filter(targetCy, timestampNanos);
+            // 一阶 1€ 滤波器平滑中心（自适应：静止强平滑滤抖、快速移动弱平滑跟手）
+            float oneEuroX = (float) filterX.filter(targetCx, timestampNanos);
+            float oneEuroY = (float) filterY.filter(targetCy, timestampNanos);
+            // 二阶 ease（慢快慢）：一阶输出后再串 EMA，阶跃响应呈 S 形 ease-in-out
+            // displayBox 朝 oneEuro 推进 (1-EASE_KEEP)，保留 EASE_KEEP → 慢起快中慢收
+            displayBox[0] = oneEuroX + EASE_KEEP * (displayBox[0] - oneEuroX);
+            displayBox[1] = oneEuroY + EASE_KEEP * (displayBox[1] - oneEuroY);
 
             // 尺寸平滑
             displayBox[2] += SIZE_SMOOTH * (box[2] - displayBox[2]);

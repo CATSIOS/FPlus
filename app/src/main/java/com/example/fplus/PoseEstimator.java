@@ -105,12 +105,19 @@ public class PoseEstimator {
     private float CBIoU_BUF_HIGH = 0.3f;   // HIGH 阶段 buffer 扩展比例
     private float CBIoU_BUF_LOW = 0.5f;    // LOW 救援 buffer 扩展比例
     private float CBIoU_IOU_LOW = 0.3f;    // LOW 救援 buffered IoU 阈值
+    // 速度自适应 buffer：速度归一化（速度/框宽）达到此值时 HIGH buffer 放大到 LOW 上限
+    // 静止时 buffer=BUF_HIGH(0.3) 防误配，快移时放大到 BUF_LOW(0.5) 防失配
+    private float CBIoU_SPEED_REF = 0.25f; // 速度归一化参考（框宽/帧）
     // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
     // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
     private static final float EXPAND_RATIO = 0.15f;
     // OC-SORT OCM：跟踪目标的速度估计（像素/帧），用于匹配前按 lost 帧数做位置外推
     private float trackVelX = 0f;
     private float trackVelY = 0f;
+    // 最后一次匹配的瞬时速度（未 EMA 平滑），Coast 外推专用：响应变向更快，
+    // 避免 EMA 速度残留旧方向导致「角色变向丢失时绿框反向滑动」
+    private float lastRawVx = 0f;
+    private float lastRawVy = 0f;
     private long lastTrackTimeNanos = 0L;
     private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数（大目标基准）
     // 方案1：Area-Adaptive Motion Damping（AKKF, arxiv 2607.12544）
@@ -128,6 +135,12 @@ public class PoseEstimator {
     // MIN_VEL：速度低于此值视为静止，不外推（避免静止时绿框漂移）
     //   - trackVelX 单位为 60fps 基准每帧位移，0.001 相当于 60fps 下 0.1% 图像宽/帧
     private static final float MIN_VEL = 0.001f;
+    // OC-SORT Coast（速度外推）参数：丢失期间用速度外推位置继续显示绿框
+    //   COAST_MIN_VEL：速度低于此值视为静止丢失，不外推直接淡出（目标真没了）
+    //   COAST_MAX_FRAMES：外推最多持续帧数，超过则淡出（防持续飘移）
+    //   仅在「明显移动 + 短时丢失」时外推衔接，解决大幅移动瞬时丢检测的闪烁
+    private float COAST_MIN_VEL = 0.01f;
+    private int COAST_MAX_FRAMES = 2;
     // OA-SORT（CVPR 2026, arxiv 2603.06034）：OAM 深度排序阈值（像素），
     // bbox 底部 y 差值小于此值不判定遮挡，避免抖动误判
     private static final float OAM_DEPTH_THRESHOLD = 5f;
@@ -235,9 +248,12 @@ public class PoseEstimator {
         CBIoU_BUF_HIGH = parseFloat(prefs, "track_buf_high", 0.3f);
         CBIoU_BUF_LOW = parseFloat(prefs, "track_buf_low", 0.5f);
         CBIoU_IOU_LOW = parseFloat(prefs, "track_iou_low", 0.3f);
+        CBIoU_SPEED_REF = parseFloat(prefs, "track_speed_ref", 0.25f);
         MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
         TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
         PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f);
+        COAST_MIN_VEL = parseFloat(prefs, "coast_min_vel", 0.01f);
+        COAST_MAX_FRAMES = parseInt(prefs, "coast_max_frames", 2);
         CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f);
         SCORE_W = parseFloat(prefs, "score_w", 0.3f);
         ROI_SCALE = parseFloat(prefs, "roi_scale", 0.7f);
@@ -397,16 +413,16 @@ public class PoseEstimator {
         float dy = targetCy - curCy;
         float dist = (float) Math.sqrt(dx * dx + dy * dy);
 
-        // 死区：目标在 ROI 中心 15% 范围内不移动，减少黄框抖动
-        float deadZone = roiSize * 0.15f;
+        // 死区：目标在 ROI 中心 8% 范围内不移动，减少黄框抖动
+        float deadZone = roiSize * 0.08f;
         if (dist <= deadZone) return;
 
         // 非线性跟随：超出死区部分按平方根缩放
-        // 目标离中心越远跟随幅度越大，但始终小于实际位移；单帧最大移动 20% ROI
+        // 目标离中心越远跟随幅度越大，但始终小于实际位移；单帧最大移动 35% ROI
         float excess = dist - deadZone;
         float ratio = excess / dist;
         float scale = (float) Math.sqrt(ratio);
-        float maxMove = roiSize * 0.2f;
+        float maxMove = roiSize * 0.35f;
         float move = Math.min(excess * scale, maxMove);
         float moveX = dx / dist * move;
         float moveY = dy / dist * move;
@@ -521,12 +537,26 @@ public class PoseEstimator {
         if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST) {
             // lost 帧数作为预测步长；+1 代表当前帧再推一次
             int steps = Math.min(trackLostFrames + 1, 5); // 上限 5 帧，避免外推过远
-            float pxC = trackedBox[0] + trackVelX * steps;
-            float pyC = trackedBox[1] + trackVelY * steps;
+            // 用瞬时速度 lastRawVx/Y 外推：EMA 变向滞后，横向快移时 predTracked 方向偏，
+            // 与真实检测 IoU 低导致断锁；瞬时速度方向跟随真实移动
+            float pxC = trackedBox[0] + lastRawVx * steps;
+            float pyC = trackedBox[1] + lastRawVy * steps;
             predTracked = new float[]{pxC, pyC, trackedBox[2], trackedBox[3]};
         }
 
-        // ===== ByteTrack 第一阶段：高置信度（conf >= HIGH=VALID_DETECTION_CONF）正常评分 =====
+        // ===== C-BIoU 速度自适应 buffer：HIGH 阶段 buffer 随速度放大 =====
+        // 速度归一化 = 速度 / 框宽，达到 SPEED_REF 时 buffer 从 BUF_HIGH 线性放大到 BUF_LOW
+        // 静止时小 buffer 防误配，快移时大 buffer 防失配
+        float dynHighBuffer = CBIoU_BUF_HIGH;
+        if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && trackedBox[2] > 1e-3f) {
+            float speed = (float) Math.sqrt(lastRawVx * lastRawVx + lastRawVy * lastRawVy);
+            float speedNorm = speed / trackedBox[2];
+            float t = speedNorm / CBIoU_SPEED_REF;
+            if (t > 1f) t = 1f;
+            dynHighBuffer = CBIoU_BUF_HIGH + (CBIoU_BUF_LOW - CBIoU_BUF_HIGH) * t;
+        }
+
+        // ===== C-BIoU 第一阶段：高置信度（conf >= HIGH=VALID_DETECTION_CONF）正常评分 =====
         PersonPose bestPose = null;
         float maxScore = -1f;
         float bestConf = 0f;
@@ -586,10 +616,10 @@ public class PoseEstimator {
                 // 组合：score = (1-W)*dist + W*angle，距离为主角度为辅
                 float posWeight = (1f - SCORE_W) * distWeight + SCORE_W * angleWeight;
 
-                // C-BIoU：跟踪加分用预测后的 trackedBox 做 buffered IoU（HIGH 阶段）
+                // C-BIoU：跟踪加分用预测后的 trackedBox 做 buffered IoU（HIGH 阶段，速度自适应 buffer）
                 float trackBonus = 1.0f;
                 boolean matched = predTracked != null
-                        && bufferedIoU(predTracked, box, CBIoU_BUF_HIGH) >= TRACK_IOU_THRESHOLD;
+                        && bufferedIoU(predTracked, box, dynHighBuffer) >= TRACK_IOU_THRESHOLD;
                 if (matched) {
                     trackBonus = TRACK_BONUS;
                 }
@@ -692,6 +722,9 @@ public class PoseEstimator {
                     if (framesElapsed < 0.5) framesElapsed = 0.5;
                     float rawVx = (newBox[0] - trackedBox[0]) / (float) framesElapsed;
                     float rawVy = (newBox[1] - trackedBox[1]) / (float) framesElapsed;
+                    // 记录瞬时速度供 Coast 外推（响应变向，EMA 有滞后）
+                    lastRawVx = rawVx;
+                    lastRawVy = rawVy;
                     // 方案1：Area-Adaptive Motion Damping（AKKF, arxiv 2607.12544）
                     // 小目标面积小，几像素抖动=大比例位移噪声，增大阻尼降低 alpha
                     // 大目标面积大，速度估计可靠，alpha 保持基准值
@@ -733,6 +766,26 @@ public class PoseEstimator {
                 float predDy = trackVelY * 60f * PREDICT_SECONDS;
                 bestPose.box[0] += predDx;
                 bestPose.box[1] += predDy;
+            }
+        }
+
+        // OC-SORT Coast（速度外推）：丢失期间用瞬时速度外推位置继续显示绿框，
+        // 仅在「明显移动（速度≥COAST_MIN_VEL）+ 短时丢失（lost≤COAST_MAX_FRAMES）」时外推，
+        // 解决大幅移动瞬时丢检测的闪烁；静止丢失或持续丢失直接 return null 触发淡出。
+        // 用 lastRawVx/Y（瞬时）而非 trackVelX（EMA）：EMA 变向滞后，会导致角色变向丢失时
+        // 绿框沿旧方向反向滑动；瞬时速度方向正确
+        if (bestPose == null && trackedBox != null
+                && trackLostFrames <= COAST_MAX_FRAMES) {
+            float speedSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
+            if (speedSq >= COAST_MIN_VEL * COAST_MIN_VEL) {
+                float steps = Math.min(trackLostFrames + 1, COAST_MAX_FRAMES);
+                bestPose = new PersonPose();
+                bestPose.box = new float[] {
+                        trackedBox[0] + lastRawVx * steps,
+                        trackedBox[1] + lastRawVy * steps,
+                        trackedBox[2],
+                        trackedBox[3]
+                };
             }
         }
 
