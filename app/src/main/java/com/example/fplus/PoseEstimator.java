@@ -86,7 +86,10 @@ public class PoseEstimator {
 
     private float[] trackedBox;
     private int trackLostFrames = 0;
-    private static final int MAX_TRACK_LOST = 20;
+    // TRACK_BUFFER：跟踪丢失保留窗口，30fps 下 30 帧 ≈ 1 秒缓冲
+    // 论文默认 60 帧（≈2秒），但游戏场景目标短暂出框/被遮挡后通常 1 秒内回归
+    // 过短（原 20 帧=0.67 秒）会导致目标短暂闪身后回来重新锁定慢
+    private static final int MAX_TRACK_LOST = 30;
     private static final float TRACK_IOU_THRESHOLD = 0.1f;
     // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
     // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
