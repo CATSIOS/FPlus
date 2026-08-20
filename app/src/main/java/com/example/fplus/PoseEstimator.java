@@ -32,7 +32,7 @@ public class PoseEstimator {
     // ByteTrack 低置信度检测阈值（第二阶段匹配），用于"救活"被遮挡/漏检但跟踪中的目标
     private static final float BYTETRACK_LOW_CONF = 0.1f;
     // 第二阶段（低置信度 + 已跟踪目标）的 IoU 匹配阈值，比正常更宽松，允许部分漏检
-    private static final float BYTETRACK_LOW_IOU = 0.1f;
+    private static final float BYTETRACK_LOW_IOU = -0.05f;
     private static final float MIN_AREA_THRESHOLD = 0.01f;
     // 距离准星（屏幕中心）的高斯权重标准差（归一化，越大锁定范围越宽）
     private static final float CENTER_SIGMA = 0.2f;
@@ -83,7 +83,7 @@ public class PoseEstimator {
     private float[] trackedBox;
     private int trackLostFrames = 0;
     private static final int MAX_TRACK_LOST = 20;
-    private static final float TRACK_IOU_THRESHOLD = 0.2f;
+    private static final float TRACK_IOU_THRESHOLD = 0.1f;
     // OC-SORT OCM：跟踪目标的速度估计（像素/帧），用于匹配前按 lost 帧数做位置外推
     private float trackVelX = 0f;
     private float trackVelY = 0f;
@@ -475,7 +475,7 @@ public class PoseEstimator {
                 // 跟踪加分用"预测后的 trackedBox"做 IoU
                 float trackBonus = 1.0f;
                 boolean matched = predTracked != null
-                        && boxIou(predTracked, box) >= TRACK_IOU_THRESHOLD;
+                        && boxEIoU(predTracked, box) >= TRACK_IOU_THRESHOLD;
                 if (matched) {
                     trackBonus = TRACK_BONUS;
                 }
@@ -511,7 +511,7 @@ public class PoseEstimator {
             for (int i = 0; i < lowCount; i++) {
                 float[] lb = lowBoxes[i];
                 float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
-                float iou = boxIou(predTracked, lbBox);
+                float iou = boxEIoU(predTracked, lbBox);
                 // LOW 阶段 IoU 阈值更宽松（0.1），允许框质量差但位置大致对得上
                 if (iou >= BYTETRACK_LOW_IOU && iou > bestLowIoU) {
                     bestLowIoU = iou;
@@ -572,6 +572,29 @@ public class PoseEstimator {
         }
 
         return bestPose;
+    }
+
+    /**
+     * EIoU（Efficient IoU）：IoU - ρ²/c²
+     * ρ = 两框中心点欧氏距离，c = 最小外接矩形对角线
+     * 小目标即使只有几像素位移 IoU 也会骤降，EIoU 额外考虑中心距离，
+     * 对近邻但不重叠的小框给出非零相似度，避免跟踪断锁。
+     */
+    private float boxEIoU(float[] boxA, float[] boxB) {
+        float iou = boxIou(boxA, boxB);
+
+        float dcx = boxA[0] - boxB[0];
+        float dcy = boxA[1] - boxB[1];
+        float rho2 = dcx * dcx + dcy * dcy;
+
+        float ex1 = Math.min(boxA[0] - boxA[2] / 2f, boxB[0] - boxB[2] / 2f);
+        float ey1 = Math.min(boxA[1] - boxA[3] / 2f, boxB[1] - boxB[3] / 2f);
+        float ex2 = Math.max(boxA[0] + boxA[2] / 2f, boxB[0] + boxB[2] / 2f);
+        float ey2 = Math.max(boxA[1] + boxA[3] / 2f, boxB[1] + boxB[3] / 2f);
+        float c2 = (ex2 - ex1) * (ex2 - ex1) + (ey2 - ey1) * (ey2 - ey1);
+
+        if (c2 < 1e-6f) return iou;
+        return iou - rho2 / c2;
     }
 
     private float boxIou(float[] boxA, float[] boxB) {

@@ -23,6 +23,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.Process;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
@@ -31,6 +32,7 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ScreenCaptureService extends Service {
 
@@ -48,6 +50,9 @@ public class ScreenCaptureService extends Service {
 
     private HandlerThread captureThread;
     private Handler captureHandler;
+    private HandlerThread inferenceThread;
+    private Handler inferenceHandler;
+    private final AtomicBoolean inferenceBusy = new AtomicBoolean(false);
     private Handler mainHandler;
 
     private PoseEstimator poseEstimator;
@@ -61,9 +66,11 @@ public class ScreenCaptureService extends Service {
     private int captureWidth;
     private int captureHeight;
 
-    // 复用缓冲，避免每帧分配
+    // 双缓冲 Bitmap：Capture 线程和 Inference 线程交替使用，避免读写冲突
+    private final Bitmap[] captureBitmaps = new Bitmap[2];
+    private int captureBitmapIdx = 0;
+    // 复用像素缓冲，避免每帧分配
     private int[] capturePixels;
-    private Bitmap captureBitmap;
 
     // 帧耗时统计
     private long estimateTimeAccum;
@@ -163,13 +170,22 @@ public class ScreenCaptureService extends Service {
         captureWidth = Math.round(screenWidth * scale);
         captureHeight = Math.round(screenHeight * scale);
 
-        imageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2);
+        imageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 3);
         virtualDisplay = mediaProjection.createVirtualDisplay(
                 "ScreenCapture",
                 captureWidth, captureHeight, metrics.densityDpi,
                 VIRTUAL_DISPLAY_FLAGS,
                 imageReader.getSurface(),
                 null, null);
+
+        // 双线程流水线：
+        //   CaptureThread（默认优先级）：acquire + imageToBitmap（像素拷贝）
+        //   InferenceThread（URGENT_DISPLAY）：estimate 推理 + post UI
+        //   双 Bitmap 交替：连续两帧返回不同 Bitmap，Inference 读完上一帧后 Capture 才回写
+        inferenceThread = new HandlerThread("InferenceThread",
+                Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        inferenceThread.start();
+        inferenceHandler = new Handler(inferenceThread.getLooper());
 
         captureThread = new HandlerThread("CaptureThread");
         captureThread.start();
@@ -180,7 +196,14 @@ public class ScreenCaptureService extends Service {
                 Bitmap frame = imageToBitmap(image);
                 image.close();
                 if (frame != null && poseEstimator != null) {
-                    processFrame(frame);
+                    // 推理忙则丢帧（保持低延迟，不积压旧帧）
+                    if (inferenceBusy.compareAndSet(false, true)) {
+                        final Bitmap fFrame = frame;
+                        inferenceHandler.post(() -> {
+                            processFrame(fFrame);
+                            inferenceBusy.set(false);
+                        });
+                    }
                 }
             }
         }, captureHandler);
@@ -243,7 +266,6 @@ public class ScreenCaptureService extends Service {
         int outIndex = 0;
 
         if (pixelStride == 4) {
-            // RGBA 紧密排列，顺序读取（比绝对定位 get 更快）
             for (int y = 0; y < captureHeight; y++) {
                 for (int x = 0; x < captureWidth; x++) {
                     int r = buffer.get() & 0xFF;
@@ -270,13 +292,20 @@ public class ScreenCaptureService extends Service {
             }
         }
 
-        if (captureBitmap == null
-                || captureBitmap.getWidth() != captureWidth
-                || captureBitmap.getHeight() != captureHeight) {
-            captureBitmap = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
+        // 双缓冲：交替返回 bitmap A/B，连续两帧返回不同实例
+        // Inference 读上一帧的 3~5ms 远小于两帧间隔（~32ms），无读写冲突
+        int idx = captureBitmapIdx;
+        captureBitmapIdx = (idx + 1) % 2;
+        Bitmap bmp = captureBitmaps[idx];
+        if (bmp == null
+                || bmp.getWidth() != captureWidth
+                || bmp.getHeight() != captureHeight) {
+            if (bmp != null) bmp.recycle();
+            bmp = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
+            captureBitmaps[idx] = bmp;
         }
-        captureBitmap.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
-        return captureBitmap;
+        bmp.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
+        return bmp;
     }
 
     private void addOverlayView() {
@@ -345,13 +374,19 @@ public class ScreenCaptureService extends Service {
             captureThread.quitSafely();
             captureThread = null;
         }
+        if (inferenceThread != null) {
+            inferenceThread.quitSafely();
+            inferenceThread = null;
+        }
         if (poseEstimator != null) {
             poseEstimator.close();
             poseEstimator = null;
         }
-        if (captureBitmap != null) {
-            captureBitmap.recycle();
-            captureBitmap = null;
+        for (int i = 0; i < captureBitmaps.length; i++) {
+            if (captureBitmaps[i] != null) {
+                captureBitmaps[i].recycle();
+                captureBitmaps[i] = null;
+            }
         }
         removeOverlayView();
         instance = null;
