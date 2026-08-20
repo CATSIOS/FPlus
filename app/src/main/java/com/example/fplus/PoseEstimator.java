@@ -99,6 +99,16 @@ public class PoseEstimator {
     private float trackVelY = 0f;
     private long lastTrackTimeNanos = 0L;
     private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数
+
+    // 预测未来位置（借鉴 Sunone Aimbot / Aimmy Kalman Lead Time）
+    // PREDICT_SECONDS：绿框显示位置外推的提前量（秒）
+    //   - Aimmy 默认 0.10s，Mvsd-scripts 默认 3 帧（60fps≈50ms）
+    //   - FPlus 移动端 30fps，0.083s ≈ 2.5 帧抵消端到端延迟
+    //   - 仍慢可调到 0.10s，跑过头（急转时绿框冲过）可降到 0.067s
+    private static final float PREDICT_SECONDS = 0.083f;
+    // MIN_VEL：速度低于此值视为静止，不外推（避免静止时绿框漂移）
+    //   - trackVelX 单位为 60fps 基准每帧位移，0.001 相当于 60fps 下 0.1% 图像宽/帧
+    private static final float MIN_VEL = 0.001f;
     // OA-SORT（CVPR 2026, arxiv 2603.06034）：OAM 深度排序阈值（像素），
     // bbox 底部 y 差值小于此值不判定遮挡，避免抖动误判
     private static final float OAM_DEPTH_THRESHOLD = 5f;
@@ -536,7 +546,9 @@ public class PoseEstimator {
         // ===== ByteTrack 第二阶段：如果已跟踪目标在 HIGH 阶段没匹配到，用 LOW 集合救援 =====
         boolean rescuedByLow = false;
         if (trackedBox != null && !bestMatchedTrack && lowCount > 0) {
-            float bestLowIoU = 0f;
+            // 注意：boxEIoU 可能为负（不重叠但近邻的小目标），初始值需低于 BYTETRACK_LOW_IOU
+            // 原 0f 会阻止所有 EIoU<0 的 LOW 候选匹配，与宽松阈值 -0.05 的设计意图不符
+            float bestLowIoU = -1f;
             float[] bestLowBox = null;
             for (int i = 0; i < lowCount; i++) {
                 float[] lb = lowBoxes[i];
@@ -625,6 +637,21 @@ public class PoseEstimator {
                 trackVelY = 0f;
                 lastTrackTimeNanos = 0L;
                 lastBestOcclusion = 0f;
+            }
+        }
+
+        // ===== 预测未来位置（方案 A + B）=====
+        // 用当前速度外推 PREDICT_SECONDS 秒后的位置，抵消检测→显示端到端延迟
+        // 静止目标（速度低于 MIN_VEL）不外推，避免静止时绿框漂移（方案 B）
+        // 注意：bestPose.box 是独立 new 出来的引用，trackedBox 已 clone，互不影响
+        // trackVelX 单位：60fps 基准每帧位移，× 60 转换为"每秒位移"再 × PREDICT_SECONDS
+        if (bestPose != null && trackedBox != null) {
+            float speedSq = trackVelX * trackVelX + trackVelY * trackVelY;
+            if (speedSq >= MIN_VEL * MIN_VEL) {
+                float predDx = trackVelX * 60f * PREDICT_SECONDS;
+                float predDy = trackVelY * 60f * PREDICT_SECONDS;
+                bestPose.box[0] += predDx;
+                bestPose.box[1] += predDy;
             }
         }
 
