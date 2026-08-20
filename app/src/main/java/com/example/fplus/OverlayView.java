@@ -22,12 +22,12 @@ public class OverlayView extends View {
 
     // 1€ 滤波器参数：最小截止频率（Hz，静止平滑度）与速度系数（快速移动响应度）
     // 可调参数（从 SharedPreferences 读取，详见 AdvancedOptionsActivity）
-    private double MIN_CUTOFF = 2.5;
+    private double MIN_CUTOFF = 2.0;
     private double BETA = 8.0;
     // 跳变阈值：位移超过该值视为目标切换/误检，限制最大移动量，避免框瞬移
     private float MAX_JUMP = 0.4f;
-    // 尺寸平滑系数
-    private static final float SIZE_SMOOTH = 0.6f;
+    // 尺寸平滑系数：越小越平滑（0=完全锁死尺寸，1=不平滑）
+    private float SIZE_SMOOTH = 0.45f;
 
     // 检测丢失后的淡出透明度（255=不透明，0=消失）
     private int fadeAlpha = 255;
@@ -72,6 +72,12 @@ public class OverlayView extends View {
         } catch (NumberFormatException e) {
             Log.w(TAG, "overlay_max_jump 解析失败，使用默认 0.4");
             MAX_JUMP = 0.4f;
+        }
+        try {
+            SIZE_SMOOTH = Float.parseFloat(prefs.getString("overlay_size_smooth", "0.45"));
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "overlay_size_smooth 解析失败，使用默认 0.45");
+            SIZE_SMOOTH = 0.45f;
         }
     }
 

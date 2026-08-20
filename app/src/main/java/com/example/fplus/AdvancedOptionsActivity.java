@@ -93,12 +93,14 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         params.add(new ParamItem("bright_offset", "25", "亮度偏移",
                 "暗景提亮（0~100）", GROUP_BRIGHT, 0, 100));
 
-        params.add(new ParamItem("overlay_min_cutoff", "2.5", "1€ 最小截止频率",
+        params.add(new ParamItem("overlay_min_cutoff", "2.0", "1€ 最小截止频率",
                 "静止平滑度（0.5~5）", GROUP_OVERLAY, 0.5, 5));
         params.add(new ParamItem("overlay_beta", "8.0", "1€ 速度系数",
                 "快速响应度（1~20）", GROUP_OVERLAY, 1, 20));
         params.add(new ParamItem("overlay_max_jump", "0.4", "最大跳变阈值",
                 "目标切换位移限制（0.1~1.0）", GROUP_OVERLAY, 0.1, 1.0));
+        params.add(new ParamItem("overlay_size_smooth", "0.45", "尺寸平滑系数",
+                "越小越稳（0~1）", GROUP_OVERLAY, 0, 1));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();
