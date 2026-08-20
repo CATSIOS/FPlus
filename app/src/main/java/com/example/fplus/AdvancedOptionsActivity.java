@@ -84,6 +84,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "锁定保持时长（5~60 帧）", GROUP_TRACKING, 5, 60));
         params.add(new ParamItem("track_takeover", "0.5", "接管置信度",
                 "新目标即时接管阈值（0.3~0.9）", GROUP_TRACKING, 0.3, 0.9));
+        params.add(new ParamItem("track_dist_weight", "0.25", "距离惩罚权重",
+                "横向断连补分强度（0~0.5）", GROUP_TRACKING, 0, 0.5));
+        params.add(new ParamItem("track_acc_threshold", "0.002", "加速度阈值",
+                "CA 外推触发加速度（0~0.02）", GROUP_TRACKING, 0, 0.02));
 
         params.add(new ParamItem("pred_seconds", "0.083", "预测时长（秒）",
                 "绿框提前量，抵消延迟（0~0.2）", GROUP_PREDICT, 0, 0.2));

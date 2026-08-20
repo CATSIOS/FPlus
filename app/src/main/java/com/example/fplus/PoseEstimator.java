@@ -108,6 +108,12 @@ public class PoseEstimator {
     // 速度自适应 buffer：速度归一化（速度/框宽）达到此值时 HIGH buffer 放大到 LOW 上限
     // 静止时 buffer=BUF_HIGH(0.3) 防误配，快移时放大到 BUF_LOW(0.5) 防失配
     private float CBIoU_SPEED_REF = 0.25f; // 速度归一化参考（框宽/帧）
+    // YOLOv8-SMOT (arxiv 2507.12087) 距离惩罚：横向快移 IoU 骤降但目标实际位移不大，
+    // sim = bufferedIoU + DIST_WEIGHT×(1 - dist/diag)，距离近补分，让 IoU 低仍可匹配防横向断锁
+    private float DIST_WEIGHT = 0.25f;
+    // 运动动力学 KF (arxiv 2505.07254)：加速度超过此值切 CA（匀加速）模型外推，
+    // 横向加速时 CA 预测更准，减少 predTracked 偏差；加速度小用 CV（匀速）
+    private float ACC_THRESHOLD = 0.002f;
     // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
     // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
     private static final float EXPAND_RATIO = 0.15f;
@@ -118,6 +124,9 @@ public class PoseEstimator {
     // 避免 EMA 速度残留旧方向导致「角色变向丢失时绿框反向滑动」
     private float lastRawVx = 0f;
     private float lastRawVy = 0f;
+    // 上上帧瞬时速度，用于算加速度 (acc = lastRawVx - prevRawVx)，CA 模型外推
+    private float prevRawVx = 0f;
+    private float prevRawVy = 0f;
     private long lastTrackTimeNanos = 0L;
     private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数（大目标基准）
     // 方案1：Area-Adaptive Motion Damping（AKKF, arxiv 2607.12544）
@@ -249,6 +258,8 @@ public class PoseEstimator {
         CBIoU_BUF_LOW = parseFloat(prefs, "track_buf_low", 0.5f);
         CBIoU_IOU_LOW = parseFloat(prefs, "track_iou_low", 0.3f);
         CBIoU_SPEED_REF = parseFloat(prefs, "track_speed_ref", 0.25f);
+        DIST_WEIGHT = parseFloat(prefs, "track_dist_weight", 0.25f);
+        ACC_THRESHOLD = parseFloat(prefs, "track_acc_threshold", 0.002f);
         MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
         TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
         PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f);
@@ -537,10 +548,21 @@ public class PoseEstimator {
         if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST) {
             // lost 帧数作为预测步长；+1 代表当前帧再推一次
             int steps = Math.min(trackLostFrames + 1, 5); // 上限 5 帧，避免外推过远
-            // 用瞬时速度 lastRawVx/Y 外推：EMA 变向滞后，横向快移时 predTracked 方向偏，
-            // 与真实检测 IoU 低导致断锁；瞬时速度方向跟随真实移动
-            float pxC = trackedBox[0] + lastRawVx * steps;
-            float pyC = trackedBox[1] + lastRawVy * steps;
+            // 运动动力学 KF (arxiv 2505.07254)：加速度大切 CA（匀加速）模型外推更准，
+            // 加速度小用 CV（匀速）。acc = lastRawVx - prevRawVx（连续两帧瞬时速度差）
+            float accX = lastRawVx - prevRawVx;
+            float accY = lastRawVy - prevRawVy;
+            float accMag = (float) Math.sqrt(accX * accX + accY * accY);
+            float pxC, pyC;
+            if (accMag >= ACC_THRESHOLD) {
+                // CA 模型：x = x0 + v*t + 0.5*a*t²，横向加速时预测更贴合
+                pxC = trackedBox[0] + lastRawVx * steps + 0.5f * accX * steps * steps;
+                pyC = trackedBox[1] + lastRawVy * steps + 0.5f * accY * steps * steps;
+            } else {
+                // CV 模型：匀速外推
+                pxC = trackedBox[0] + lastRawVx * steps;
+                pyC = trackedBox[1] + lastRawVy * steps;
+            }
             predTracked = new float[]{pxC, pyC, trackedBox[2], trackedBox[3]};
         }
 
@@ -619,7 +641,7 @@ public class PoseEstimator {
                 // C-BIoU：跟踪加分用预测后的 trackedBox 做 buffered IoU（HIGH 阶段，速度自适应 buffer）
                 float trackBonus = 1.0f;
                 boolean matched = predTracked != null
-                        && bufferedIoU(predTracked, box, dynHighBuffer) >= TRACK_IOU_THRESHOLD;
+                        && simTrack(predTracked, box, dynHighBuffer) >= TRACK_IOU_THRESHOLD;
                 if (matched) {
                     trackBonus = TRACK_BONUS;
                 }
@@ -723,6 +745,8 @@ public class PoseEstimator {
                     float rawVx = (newBox[0] - trackedBox[0]) / (float) framesElapsed;
                     float rawVy = (newBox[1] - trackedBox[1]) / (float) framesElapsed;
                     // 记录瞬时速度供 Coast 外推（响应变向，EMA 有滞后）
+                    prevRawVx = lastRawVx;
+                    prevRawVy = lastRawVy;
                     lastRawVx = rawVx;
                     lastRawVy = rawVy;
                     // 方案1：Area-Adaptive Motion Damping（AKKF, arxiv 2607.12544）
@@ -824,6 +848,25 @@ public class PoseEstimator {
         // 并集与 IoU
         float union = aW * aH + bW * bH - inter;
         return union > 0 ? inter / union : 0;
+    }
+
+    /**
+     * 距离惩罚混合相似度（YOLOv8-SMOT, arxiv 2507.12087）。
+     * sim = bufferedIoU + DIST_WEIGHT×(1 - dist/diag)
+     * 横向快移 IoU 骤降但目标实际位移不大时，中心距离近补分，让匹配通过防断锁。
+     * 距离 0 补 DIST_WEIGHT，距离远（≥对角线）补 0。
+     */
+    private float simTrack(float[] boxA, float[] boxB, float bufRatio) {
+        float iou = bufferedIoU(boxA, boxB, bufRatio);
+        float dx = boxA[0] - boxB[0];
+        float dy = boxA[1] - boxB[1];
+        float dist = (float) Math.sqrt(dx * dx + dy * dy);
+        float diagA = (float) Math.sqrt(boxA[2] * boxA[2] + boxA[3] * boxA[3]);
+        float diagB = (float) Math.sqrt(boxB[2] * boxB[2] + boxB[3] * boxB[3]);
+        float diag = Math.max(diagA, diagB);
+        if (diag < 1e-6f) return iou;
+        float distNorm = Math.min(1f, dist / diag);
+        return iou + DIST_WEIGHT * (1f - distNorm);
     }
 
     /**
