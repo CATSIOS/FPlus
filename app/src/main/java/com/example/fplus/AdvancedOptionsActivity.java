@@ -58,6 +58,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
     private static final String GROUP_ROI = "ROI";
     private static final String GROUP_BRIGHT = "亮度增强";
     private static final String GROUP_OVERLAY = "Overlay 滤波";
+    private static final String GROUP_DUAL = "双实例并发";
 
     /** 参数定义表：key 必须与 PoseEstimator/OverlayView 中读取逻辑一致 */
     private final List<ParamItem> params = new ArrayList<>();
@@ -119,6 +120,11 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "越小越稳（0~1）", GROUP_OVERLAY, 0, 1));
         params.add(new ParamItem("overlay_ease", "0.4", "ease 慢快慢",
                 "二阶缓动保留比例（0~0.8）", GROUP_OVERLAY, 0, 0.8));
+
+        params.add(new ParamItem("dual_infer", "0", "双实例并发",
+                "1=开启第二路放大区推理，榨GPU算力（0/1）", GROUP_DUAL, 0, 1));
+        params.add(new ParamItem("dual_zoom", "0.5", "放大区比例",
+                "第二路区域相对ROI（0.3~0.8，越小放大越大）", GROUP_DUAL, 0.3, 0.8));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();

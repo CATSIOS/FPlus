@@ -22,6 +22,11 @@ import java.nio.FloatBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class PoseEstimator {
 
@@ -71,6 +76,38 @@ public class PoseEstimator {
     private Rect scaleRect;
     private Rect scaleSrcRect;
     private float[][][] output;
+
+    // ===== PoC: 双实例并发推理（榨 GPU 并行算力）=====
+    // 目的：验证 TFLite 双 GpuDelegate 实例能否真并发，榨干 GPU 空闲算力且端到端不卡。
+    // 第二路跑「中心放大区」（ROI 中心 zoomSize 正方形缩放到 640），远处小目标放大后更易检出。
+    // 第二套资源与主路完全隔离，避免并发时 pixels/floats/buffer/canvas 字段冲突。
+    // PoC1 阶段：不融合第二路结果到主路跟踪，仅日志对比检出差异 + 并发性能数据。
+    private boolean DUAL_INFER_ENABLED = false;          // 开关：默认关，保证开关关时行为与单实例逐字节一致
+    private float DUAL_ZOOM = 0.5f;                       // 第二路区域相对主 ROI 边长比例（越小放大倍数越大）
+    private Interpreter interpreter2;
+    private GpuDelegate gpuDelegate2;
+    private ByteBuffer inputBuffer2;
+    private FloatBuffer inputFloatBuffer2;
+    private float[] inputFloats2;
+    private int[] pixels2;
+    private float[][][] output2;
+    private Bitmap scaledRoi2;
+    private Canvas scaleCanvas2;
+    private Paint scalePaint2;
+    private Rect scaleRect2;
+    private Rect scaleSrcRect2;
+    private ExecutorService secondExecutor;
+    // 第二路 infer 耗时（跨线程写、主线程读），AtomicLong 保证可见性
+    private final AtomicLong secondInferNanos = new AtomicLong(0L);
+    // 双实例性能统计（每 30 帧打一次，对比单路基准）
+    private long dualMainInferAccum;
+    private long dual2ndInferAccum;
+    private long dualTotalAccum;
+    private int dualFrames;
+    // 第二路当前帧 zoom 区域（每帧由 preprocessBitmap2 计算，供 parseOutput2 反变换）
+    private int zoomSize;
+    private int zoomX;
+    private int zoomY;
 
     // 输出维度顺序：true 表示 [1, channels, anchors]，false 表示 [1, anchors, channels]
     private boolean channelFirst = true;
@@ -241,6 +278,11 @@ public class PoseEstimator {
         inputBuffer.order(ByteOrder.nativeOrder());
         inputBuffer.rewind();
         inputFloatBuffer = inputBuffer.asFloatBuffer();
+
+        // ===== 双实例并发 PoC：仅开关开启时建第二套资源，关闭时零开销 =====
+        if (DUAL_INFER_ENABLED) {
+            initSecondInstance(modelBuffer);
+        }
     }
 
     /**
@@ -271,6 +313,9 @@ public class PoseEstimator {
         BRIGHTNESS_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
         BRIGHTNESS_OFFSET = parseFloat(prefs, "bright_offset", 25f);
         BRIGHTNESS_OFFSET_NORM = BRIGHTNESS_OFFSET * INV_255;
+        // 双实例并发 PoC 开关（"1"=开），zoom 比例
+        DUAL_INFER_ENABLED = "1".equals(prefs.getString("dual_infer", "0"));
+        DUAL_ZOOM = parseFloat(prefs, "dual_zoom", 0.5f);
     }
 
     private float parseFloat(SharedPreferences prefs, String key, float def) {
@@ -345,6 +390,67 @@ public class PoseEstimator {
         }
     }
 
+    /** 双实例第二路 Interpreter（独立 GpuDelegate，与主路命令队列隔离，可并发） */
+    private boolean tryCreateInterpreter2(MappedByteBuffer modelBuffer) {
+        Interpreter.Options options = new Interpreter.Options();
+        options.setNumThreads(4);
+        try {
+            CompatibilityList cl = new CompatibilityList();
+            if (!cl.isDelegateSupportedOnThisDevice()) {
+                Log.w(TAG, "[2nd] GPU delegate 不受支持，双实例禁用");
+                return false;
+            }
+            gpuDelegate2 = new GpuDelegate();
+            options.addDelegate(gpuDelegate2);
+        } catch (Throwable t) {
+            Log.w(TAG, "[2nd] 创建 GPU delegate 失败", t);
+            closeSecondHardwareDelegate();
+            return false;
+        }
+        modelBuffer.rewind();
+        try {
+            interpreter2 = new Interpreter(modelBuffer, options);
+            Log.d(TAG, "[2nd] GPU interpreter 初始化成功");
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "[2nd] 模型加载失败", t);
+            closeSecondHardwareDelegate();
+            interpreter2 = null;
+            return false;
+        }
+    }
+
+    /** 初始化第二套输入/输出/绘制资源与并发执行器 */
+    private void initSecondInstance(MappedByteBuffer modelBuffer) {
+        if (!tryCreateInterpreter2(modelBuffer)) {
+            Log.w(TAG, "双实例第二路初始化失败，回退单实例");
+            return;
+        }
+        inputBuffer2 = ByteBuffer.allocateDirect(1 * 3 * inputSize * inputSize * 4);
+        inputBuffer2.order(ByteOrder.nativeOrder());
+        inputBuffer2.rewind();
+        inputFloatBuffer2 = inputBuffer2.asFloatBuffer();
+        output2 = new float[output.length][output[0].length][output[0][0].length];
+        scaledRoi2 = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888);
+        scaleCanvas2 = new Canvas(scaledRoi2);
+        scalePaint2 = new Paint(Paint.FILTER_BITMAP_FLAG);
+        scaleRect2 = new Rect(0, 0, inputSize, inputSize);
+        scaleSrcRect2 = new Rect();
+        secondExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "SecondInferThread");
+            t.setPriority(Thread.MAX_PRIORITY);
+            return t;
+        });
+        Log.d(TAG, "双实例并发已启用，DUAL_ZOOM=" + DUAL_ZOOM);
+    }
+
+    private void closeSecondHardwareDelegate() {
+        if (gpuDelegate2 != null) {
+            gpuDelegate2.close();
+            gpuDelegate2 = null;
+        }
+    }
+
     public PersonPose estimate(Bitmap bitmap) {
         originalWidth = bitmap.getWidth();
         originalHeight = bitmap.getHeight();
@@ -354,6 +460,15 @@ public class PoseEstimator {
         long t1 = System.nanoTime();
         bitmapToByteBuffer(resizedBitmap);
         long t2 = System.nanoTime();
+
+        // 双实例并发：提交第二路（中心放大区），主线程同时跑主路 infer
+        Future<PersonPose> f2 = null;
+        long dualStart = 0L;
+        if (DUAL_INFER_ENABLED && secondExecutor != null && interpreter2 != null) {
+            dualStart = System.nanoTime();
+            f2 = secondExecutor.submit(() -> runSecondInference(bitmap));
+        }
+
         interpreter.run(inputBuffer, output);
         long t3 = System.nanoTime();
         PersonPose pose = parseOutput();
@@ -378,6 +493,35 @@ public class PoseEstimator {
             inferAccum = 0;
             parseAccum = 0;
             timingFrames = 0;
+        }
+
+        // 第二路结果收集 + 并发性能对比日志（PoC1 阶段不融合，主路 pose 不变）
+        if (f2 != null) {
+            try {
+                PersonPose pose2 = f2.get();
+                long dualEnd = System.nanoTime();
+                long mainInferMs = (t3 - t2) / 1_000_000;
+                long secondInferMs = secondInferNanos.get() / 1_000_000;
+                long dualTotalMs = (dualEnd - dualStart) / 1_000_000;
+                dualMainInferAccum += mainInferMs;
+                dual2ndInferAccum += secondInferMs;
+                dualTotalAccum += dualTotalMs;
+                dualFrames++;
+                if (dualFrames >= 30) {
+                    Log.d(TAG, String.format(
+                            "[dual] 主路infer=%.1fms 第二路infer=%.1fms 并发总=%.1fms 第二路检出=%s",
+                            dualMainInferAccum / (double) dualFrames,
+                            dual2ndInferAccum / (double) dualFrames,
+                            dualTotalAccum / (double) dualFrames,
+                            (pose2 != null ? "有" : "无")));
+                    dualMainInferAccum = 0;
+                    dual2ndInferAccum = 0;
+                    dualTotalAccum = 0;
+                    dualFrames = 0;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "[2nd] 收集失败", e);
+            }
         }
 
         if (pose != null && pose.box != null) {
@@ -507,6 +651,123 @@ public class PoseEstimator {
         inputFloatBuffer.rewind();
         inputFloatBuffer.put(inputFloats);
         inputBuffer.rewind();
+    }
+
+    /** 第二路并发推理：中心放大区裁剪→缩放→独立 buffer→interpreter2 推理→parseOutput2 */
+    private PersonPose runSecondInference(Bitmap source) {
+        try {
+            Bitmap rb2 = preprocessBitmap2(source);
+            bitmapToByteBuffer2(rb2);
+            long ti0 = System.nanoTime();
+            interpreter2.run(inputBuffer2, output2);
+            long ti1 = System.nanoTime();
+            secondInferNanos.set(ti1 - ti0);
+            return parseOutput2();
+        } catch (Throwable t) {
+            Log.w(TAG, "[2nd] 推理异常", t);
+            return null;
+        }
+    }
+
+    /** 第二路预处理：从原图裁中心放大区（跟随主 ROI 中心）缩放到 640 */
+    private Bitmap preprocessBitmap2(Bitmap source) {
+        int sw = source.getWidth();
+        int sh = source.getHeight();
+        int base = Math.min(sw, sh);
+        zoomSize = Math.max(16, (int) (base * ROI_SCALE * DUAL_ZOOM));
+        int maxZoom = Math.min(sw, sh);
+        if (zoomSize > maxZoom) zoomSize = maxZoom;
+        float zoomCx = roiX + roiSize / 2f;
+        float zoomCy = roiY + roiSize / 2f;
+        zoomX = (int) Math.max(0, Math.min(sw - zoomSize, zoomCx - zoomSize / 2f));
+        zoomY = (int) Math.max(0, Math.min(sh - zoomSize, zoomCy - zoomSize / 2f));
+        scaleSrcRect2.set(zoomX, zoomY, zoomX + zoomSize, zoomY + zoomSize);
+        scaleCanvas2.drawBitmap(source, scaleSrcRect2, scaleRect2, scalePaint2);
+        return scaledRoi2;
+    }
+
+    /** 第二路输入转换：独立 pixels2/inputFloats2/inputBuffer2，避免并发字段冲突 */
+    private void bitmapToByteBuffer2(Bitmap bitmap) {
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        int len = width * height;
+        if (pixels2 == null || pixels2.length != len) {
+            pixels2 = new int[len];
+        }
+        bitmap.getPixels(pixels2, 0, width, 0, 0, width, height);
+        int total = len * 3;
+        if (inputFloats2 == null || inputFloats2.length != total) {
+            inputFloats2 = new float[total];
+        }
+        if (inputNchw) {
+            for (int i = 0; i < len; i++) {
+                int p = pixels2[i];
+                inputFloats2[i] = brighten(((p >> 16) & 0xFF) * INV_255);
+                inputFloats2[len + i] = brighten(((p >> 8) & 0xFF) * INV_255);
+                inputFloats2[len * 2 + i] = brighten((p & 0xFF) * INV_255);
+            }
+        } else {
+            for (int i = 0; i < len; i++) {
+                int p = pixels2[i];
+                int base = i * 3;
+                inputFloats2[base] = brighten(((p >> 16) & 0xFF) * INV_255);
+                inputFloats2[base + 1] = brighten(((p >> 8) & 0xFF) * INV_255);
+                inputFloats2[base + 2] = brighten((p & 0xFF) * INV_255);
+            }
+        }
+        inputFloatBuffer2.rewind();
+        inputFloatBuffer2.put(inputFloats2);
+        inputBuffer2.rewind();
+    }
+
+    private float getOutputValue2(int channel, int anchor) {
+        if (channelFirst) {
+            return output2[0][channel][anchor];
+        } else {
+            return output2[0][anchor][channel];
+        }
+    }
+
+    /**
+     * 第二路精简解析：遍历 anchors，选 conf>=VALID 的最高分（距离中心+置信度），
+     * box 反变换到原图像素坐标。不做跟踪/OCM/C-BIoU（那是主路职责）。
+     * 返回 PersonPose.box=[px,py,pw,ph,conf]，仅用于 PoC1 日志检出对比。
+     */
+    private PersonPose parseOutput2() {
+        int numPredictions = numAnchors;
+        PersonPose best = null;
+        float maxScore = -1f;
+        for (int i = 0; i < numPredictions; i++) {
+            float boxConf = 0;
+            for (int c = 4; c < numChannels; c++) {
+                float conf = getOutputValue2(c, i);
+                if (conf > boxConf) boxConf = conf;
+            }
+            if (boxConf < VALID_DETECTION_CONF) continue;
+            float cx = getOutputValue2(0, i);
+            float cy = getOutputValue2(1, i);
+            float w = getOutputValue2(2, i);
+            float h = getOutputValue2(3, i);
+            float area = w * h;
+            if (area < MIN_AREA_THRESHOLD) continue;
+            // 反变换到原图像素坐标（第二路 zoom 区域，与主路 cx*roiSize+roiX 同理）
+            float px = cx * zoomSize + zoomX;
+            float py = cy * zoomSize + zoomY;
+            float pw = w * zoomSize;
+            float ph = h * zoomSize;
+            float dx = (px - originalWidth / 2f) / originalWidth;
+            float dy = (py - originalHeight / 2f) / originalHeight;
+            float distToCenter = (float) Math.sqrt(dx * dx + dy * dy);
+            float distWeight = (float) Math.exp(-(distToCenter * distToCenter)
+                    / (2 * CENTER_SIGMA * CENTER_SIGMA));
+            float score = distWeight * boxConf;
+            if (score > maxScore) {
+                maxScore = score;
+                best = new PersonPose();
+                best.box = new float[]{px, py, pw, ph, boxConf};
+            }
+        }
+        return best;
     }
 
     private float brighten(float v) {
@@ -1036,6 +1297,30 @@ public class PoseEstimator {
     }
 
     public void close() {
+        // 先关第二实例（含 executor），避免并发期间释放主实例引发竞态
+        if (secondExecutor != null) {
+            secondExecutor.shutdownNow();
+            try {
+                secondExecutor.awaitTermination(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+            }
+            secondExecutor = null;
+        }
+        if (interpreter2 != null) {
+            interpreter2.close();
+            interpreter2 = null;
+        }
+        closeSecondHardwareDelegate();
+        if (scaledRoi2 != null) {
+            scaledRoi2.recycle();
+            scaledRoi2 = null;
+        }
+        inputBuffer2 = null;
+        inputFloatBuffer2 = null;
+        inputFloats2 = null;
+        pixels2 = null;
+        output2 = null;
+
         if (interpreter != null) {
             interpreter.close();
             interpreter = null;
