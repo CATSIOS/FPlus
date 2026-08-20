@@ -38,6 +38,10 @@ public class PoseEstimator {
     private static final float CENTER_SIGMA = 0.2f;
     // 当前锁定目标的连续性加成倍数（防止多目标间来回跳）
     private static final float TRACK_BONUS = 2.0f;
+    // 接管阈值：新目标置信度 ≥ 此值时绕过 anti-lock-jump 保护，立即切换锁定
+    // 解决「人物突然入场」场景下被压制 MAX_TRACK_LOST 帧导致的 ~0.5s 延迟
+    // 远处小目标置信度通常 < 0.5，仍受保护；清晰人物入场 > 0.5 可即时响应
+    private static final float TAKEOVER_CONF = 0.5f;
     // ROI（黄框）占短边的比例，缩小让识别区域更聚焦中心
     private static final float ROI_SCALE = 0.7f;
     // 目标丢失时 ROI 回中的平滑系数（每帧移动剩余距离的比例）
@@ -84,6 +88,9 @@ public class PoseEstimator {
     private int trackLostFrames = 0;
     private static final int MAX_TRACK_LOST = 20;
     private static final float TRACK_IOU_THRESHOLD = 0.1f;
+    // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
+    // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
+    private static final float EXPAND_RATIO = 0.15f;
     // OC-SORT OCM：跟踪目标的速度估计（像素/帧），用于匹配前按 lost 帧数做位置外推
     private float trackVelX = 0f;
     private float trackVelY = 0f;
@@ -533,8 +540,10 @@ public class PoseEstimator {
         // HIGH 阶段若已选到"非跟踪目标"的高分框（例如画面边缘另一个人突然出现），
         // 但当前仍在锁定中，我们不应该抢走锁定。逻辑：在 trackedBox 仍有效（lostFrames 不大）
         // 情况下，如果 bestMatchedTrack == false 说明 HIGH 选的不是当前目标，保持旧 trackedBox
+        // 例外：若新目标置信度 ≥ TAKEOVER_CONF（清晰人物突然入场），允许立即接管，
+        // 避免被压制 MAX_TRACK_LOST 帧造成的 0.5s+ 入场延迟
         if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack
-                && bestPose != null && !rescuedByLow) {
+                && bestPose != null && !rescuedByLow && bestConf < TAKEOVER_CONF) {
             // 不接受这个新目标（把 bestPose 置空，交给 lost++ 逻辑，让跟踪继续沿用旧轨迹）
             bestPose = null;
             bestConf = 0f;
@@ -575,22 +584,54 @@ public class PoseEstimator {
     }
 
     /**
-     * EIoU（Efficient IoU）：IoU - ρ²/c²
-     * ρ = 两框中心点欧氏距离，c = 最小外接矩形对角线
-     * 小目标即使只有几像素位移 IoU 也会骤降，EIoU 额外考虑中心距离，
-     * 对近邻但不重叠的小框给出非零相似度，避免跟踪断锁。
+     * 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：
+     * 在 EIoU 基础上对两框各方向扩展 EXPAND_RATIO 后计算 IoU，再叠加中心距离惩罚。
+     * - bbox 扩展提升小目标重叠率（远处小人仅几像素位移 IoU 不再骤降为 0）
+     * - 中心距离惩罚 ρ²/c² 对近邻但不重叠的框仍给出非零相似度，避免跟踪断锁
+     * 整体内联实现，零内存分配，避免 GC 压力。
      */
     private float boxEIoU(float[] boxA, float[] boxB) {
-        float iou = boxIou(boxA, boxB);
+        // 扩展两框：中心不变，宽高 × (1 + 2*EXPAND_RATIO)
+        float eaW = boxA[2] * (1f + 2f * EXPAND_RATIO);
+        float eaH = boxA[3] * (1f + 2f * EXPAND_RATIO);
+        float ebW = boxB[2] * (1f + 2f * EXPAND_RATIO);
+        float ebH = boxB[3] * (1f + 2f * EXPAND_RATIO);
 
+        // 扩展后两框的角点
+        float ax1 = boxA[0] - eaW / 2f;
+        float ay1 = boxA[1] - eaH / 2f;
+        float ax2 = boxA[0] + eaW / 2f;
+        float ay2 = boxA[1] + eaH / 2f;
+        float bx1 = boxB[0] - ebW / 2f;
+        float by1 = boxB[1] - ebH / 2f;
+        float bx2 = boxB[0] + ebW / 2f;
+        float by2 = boxB[1] + ebH / 2f;
+
+        // 交集
+        float x1 = Math.max(ax1, bx1);
+        float y1 = Math.max(ay1, by1);
+        float x2 = Math.min(ax2, bx2);
+        float y2 = Math.min(ay2, by2);
+        float interW = Math.max(0, x2 - x1);
+        float interH = Math.max(0, y2 - y1);
+        float inter = interW * interH;
+
+        // 并集与 IoU
+        float areaA = eaW * eaH;
+        float areaB = ebW * ebH;
+        float union = areaA + areaB - inter;
+        float iou = union > 0 ? inter / union : 0;
+
+        // EIoU 中心距离惩罚：ρ = 原始框中心点欧氏距离
         float dcx = boxA[0] - boxB[0];
         float dcy = boxA[1] - boxB[1];
         float rho2 = dcx * dcx + dcy * dcy;
 
-        float ex1 = Math.min(boxA[0] - boxA[2] / 2f, boxB[0] - boxB[2] / 2f);
-        float ey1 = Math.min(boxA[1] - boxA[3] / 2f, boxB[1] - boxB[3] / 2f);
-        float ex2 = Math.max(boxA[0] + boxA[2] / 2f, boxB[0] + boxB[2] / 2f);
-        float ey2 = Math.max(boxA[1] + boxA[3] / 2f, boxB[1] + boxB[3] / 2f);
+        // 最小外接矩形对角线 c（用扩展后框计算）
+        float ex1 = Math.min(ax1, bx1);
+        float ey1 = Math.min(ay1, by1);
+        float ex2 = Math.max(ax2, bx2);
+        float ey2 = Math.max(ay2, by2);
         float c2 = (ex2 - ex1) * (ex2 - ex1) + (ey2 - ey1) * (ey2 - ey1);
 
         if (c2 < 1e-6f) return iou;
