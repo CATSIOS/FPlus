@@ -96,6 +96,11 @@ public class PoseEstimator {
     private float trackVelY = 0f;
     private long lastTrackTimeNanos = 0L;
     private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数
+    // OA-SORT（CVPR 2026, arxiv 2603.06034）：OAM 深度排序阈值（像素），
+    // bbox 底部 y 差值小于此值不判定遮挡，避免抖动误判
+    private static final float OAM_DEPTH_THRESHOLD = 5f;
+    // OA-SORT BAM：上一帧 bestPose 的遮挡系数 [0,1]，本帧 trackedBox 更新时降低对观测的信任
+    private float lastBestOcclusion = 0f;
 
     // 分阶段计时统计
     private long preprocessAccum;
@@ -425,6 +430,11 @@ public class PoseEstimator {
         int lowCap = 32;
         lowBoxes = new float[lowCap][];
 
+        // OA-SORT OAM：收集 HIGH 检测框用于 bestPose 遮挡系数计算
+        int highCap = 32;
+        float[][] highBoxes = new float[highCap][];
+        int highCount = 0;
+
         // ===== OC-SORT OCM：先对 trackedBox 做基于速度的位置外推 =====
         // 用「预测后的 trackedBox」去跟检测框做匹配，解决突然移动（开镜）时 IoU 骤降断锁
         float[] predTracked = trackedBox;
@@ -472,6 +482,16 @@ public class PoseEstimator {
             if (boxConf >= VALID_DETECTION_CONF) {
                 // === HIGH 分支：参与综合评分选主目标 ===
                 float[] box = new float[]{px, py, pw, ph};
+
+                // OA-SORT OAM：收集 HIGH 检测框，bestPose 选出后用于计算被遮挡系数
+                if (highCount >= highCap) {
+                    int newHighCap = highCap * 2;
+                    float[][] newHigh = new float[newHighCap][];
+                    System.arraycopy(highBoxes, 0, newHigh, 0, highCap);
+                    highBoxes = newHigh;
+                    highCap = newHighCap;
+                }
+                highBoxes[highCount++] = box;
 
                 float dx = (px - originalWidth / 2f) / originalWidth;
                 float dy = (py - originalHeight / 2f) / originalHeight;
@@ -549,23 +569,47 @@ public class PoseEstimator {
             bestConf = 0f;
         }
 
+        // ===== OA-SORT OAM：计算当前 bestPose 被其他 HIGH 检测框遮挡的系数 =====
+        // 用于下一帧 BAM 加权：遮挡时降低对观测的信任，更多依赖 predTracked
+        float currentOcclusion = 0f;
+        if (bestPose != null && highCount > 1) {
+            currentOcclusion = computeOcclusion(bestPose.box, highBoxes, highCount);
+        }
+
         // ===== 更新速度估计 & 跟踪状态 =====
         long nowNanos = System.nanoTime();
         if (bestPose != null) {
-            // 用 dt 归一化再 EMA 更新速度
+            // OA-SORT BAM (Bias-Aware Momentum)：
+            // BAM = IoU(predTracked, Z) · (1 - Oc_prev)
+            // Z' = BAM · Z + (1 - BAM) · predTracked
+            // 遮挡严重（Oc_prev 大）或观测与预测位置偏离（IoU 低）时，BAM 减小，
+            // trackedBox 更多沿用 predTracked 速度外推，防止遮挡中漂移的检测框污染轨迹
+            float[] newBox = bestPose.box.clone();
+            if (trackedBox != null && predTracked != null && predTracked != trackedBox) {
+                float bam = boxIou(predTracked, newBox) * (1f - lastBestOcclusion);
+                if (bam < 0f) bam = 0f;
+                else if (bam > 1f) bam = 1f;
+                if (bam < 1f) {
+                    for (int k = 0; k < 4; k++) {
+                        newBox[k] = bam * newBox[k] + (1f - bam) * predTracked[k];
+                    }
+                }
+            }
+            // 速度估计基于混合后的 newBox，保持与 trackedBox 一致性
             if (lastTrackTimeNanos != 0L && trackedBox != null) {
                 double dtSec = (nowNanos - lastTrackTimeNanos) / 1_000_000_000.0;
                 if (dtSec > 1e-6) {
                     // 60fps 基准帧时长 (16.6ms) 做归一化
                     double framesElapsed = dtSec / (1.0 / 60.0);
                     if (framesElapsed < 0.5) framesElapsed = 0.5;
-                    float rawVx = (bestPose.box[0] - trackedBox[0]) / (float) framesElapsed;
-                    float rawVy = (bestPose.box[1] - trackedBox[1]) / (float) framesElapsed;
+                    float rawVx = (newBox[0] - trackedBox[0]) / (float) framesElapsed;
+                    float rawVy = (newBox[1] - trackedBox[1]) / (float) framesElapsed;
                     trackVelX = (1 - VEL_EMA_ALPHA) * trackVelX + VEL_EMA_ALPHA * rawVx;
                     trackVelY = (1 - VEL_EMA_ALPHA) * trackVelY + VEL_EMA_ALPHA * rawVy;
                 }
             }
-            trackedBox = bestPose.box.clone();
+            trackedBox = newBox;
+            lastBestOcclusion = currentOcclusion;
             trackLostFrames = 0;
             lastTrackTimeNanos = nowNanos;
         } else if (trackedBox != null) {
@@ -577,6 +621,7 @@ public class PoseEstimator {
                 trackVelX = 0f;
                 trackVelY = 0f;
                 lastTrackTimeNanos = 0L;
+                lastBestOcclusion = 0f;
             }
         }
 
@@ -636,6 +681,53 @@ public class PoseEstimator {
 
         if (c2 < 1e-6f) return iou;
         return iou - rho2 / c2;
+    }
+
+    /**
+     * OA-SORT OAM (Occlusion-Aware Module) 简化版（CVPR 2026, arxiv 2603.06034）：
+     * 计算目标被其他 HIGH 检测框遮挡的面积比例。
+     * - Depth Sorting：bbox 底部 y 越大越靠前（俯视相机成像原理）
+     *   若 other_bottom > target_bottom + OAM_DEPTH_THRESHOLD，判定 other 在前面遮挡 target
+     * - 遮挡系数 = 被遮挡面积 / target 自身面积
+     * - 不实施 Gaussian Map（像素级权重开销大，简化版省略）
+     * 内联计算，零内存分配。
+     */
+    private float computeOcclusion(float[] targetBox, float[][] highBoxes, int highCount) {
+        float targetCx = targetBox[0];
+        float targetCy = targetBox[1];
+        float targetW = targetBox[2];
+        float targetH = targetBox[3];
+        float targetBottom = targetCy + targetH / 2f;
+        float targetArea = targetW * targetH;
+        if (targetArea < 1e-6f) return 0f;
+
+        float targetX1 = targetCx - targetW / 2f;
+        float targetY1 = targetCy - targetH / 2f;
+        float targetX2 = targetCx + targetW / 2f;
+        float targetY2 = targetCy + targetH / 2f;
+
+        float occludedArea = 0f;
+        for (int i = 0; i < highCount; i++) {
+            float[] other = highBoxes[i];
+            if (other == targetBox) continue;  // 引用比较跳过自身
+
+            float otherBottom = other[1] + other[3] / 2f;
+            // Depth Sorting：other 必须明显在 target 前面才算遮挡
+            if (otherBottom <= targetBottom + OAM_DEPTH_THRESHOLD) continue;
+
+            // 计算交集面积
+            float ix1 = Math.max(targetX1, other[0] - other[2] / 2f);
+            float iy1 = Math.max(targetY1, other[1] - other[3] / 2f);
+            float ix2 = Math.min(targetX2, other[0] + other[2] / 2f);
+            float iy2 = Math.min(targetY2, other[1] + other[3] / 2f);
+            float interW = Math.max(0, ix2 - ix1);
+            float interH = Math.max(0, iy2 - iy1);
+            occludedArea += interW * interH;
+        }
+
+        // 多目标重叠时总遮挡面积不超过 target 自身
+        if (occludedArea > targetArea) occludedArea = targetArea;
+        return occludedArea / targetArea;
     }
 
     private float boxIou(float[] boxA, float[] boxB) {
