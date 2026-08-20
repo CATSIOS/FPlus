@@ -66,12 +66,18 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         params.add(new ParamItem("det_conf", "0.15", "置信度阈值",
                 "YOLO 检测框置信度下限（0.05~0.5）", GROUP_DETECTION, 0.05, 0.5));
         params.add(new ParamItem("det_valid", "0.2", "有效检测置信度",
-                "ByteTrack HIGH 阶段阈值（0.1~0.5）", GROUP_DETECTION, 0.1, 0.5));
+                "C-BIoU HIGH 检测阈值（0.1~0.5）", GROUP_DETECTION, 0.1, 0.5));
         params.add(new ParamItem("det_min_area", "0.01", "最小面积阈值",
                 "过滤小 UI 元素（0.001~0.1）", GROUP_DETECTION, 0.001, 0.1));
 
-        params.add(new ParamItem("track_iou", "0.1", "跟踪 IoU 阈值",
-                "HIGH 阶段匹配阈值，EIoU 值（-0.1~0.5）", GROUP_TRACKING, -0.1, 0.5));
+        params.add(new ParamItem("track_iou", "0.2", "C-BIoU HIGH 阈值",
+                "HIGH 阶段 buffered IoU 阈值（0~1）", GROUP_TRACKING, 0, 1));
+        params.add(new ParamItem("track_buf_high", "0.3", "C-BIoU HIGH 缓冲",
+                "HIGH 阶段 buffer 扩展比例（0~1）", GROUP_TRACKING, 0, 1));
+        params.add(new ParamItem("track_iou_low", "0.3", "C-BIoU LOW 阈值",
+                "LOW 救援 buffered IoU 阈值（0~1）", GROUP_TRACKING, 0, 1));
+        params.add(new ParamItem("track_buf_low", "0.5", "C-BIoU LOW 缓冲",
+                "LOW 救援 buffer 扩展比例（0~1）", GROUP_TRACKING, 0, 1));
         params.add(new ParamItem("track_max_lost", "30", "最大跟踪丢失帧数",
                 "锁定保持时长（5~60 帧）", GROUP_TRACKING, 5, 60));
         params.add(new ParamItem("track_takeover", "0.5", "接管置信度",

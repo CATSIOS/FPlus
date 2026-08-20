@@ -29,12 +29,10 @@ public class PoseEstimator {
     private static final int INPUT_SIZE = 640;
     // 可调参数（从 SharedPreferences 读取，详见 AdvancedOptionsActivity）
     private float CONFIDENCE_THRESHOLD = 0.15f;
-    // 判定为「有效目标」的最低置信度：ByteTrack 高置信度检测阈值
+    // 判定为「有效目标」的最低置信度：C-BIoU 高置信度检测阈值
     private float VALID_DETECTION_CONF = 0.2f;
-    // ByteTrack 低置信度检测阈值（第二阶段匹配），用于"救活"被遮挡/漏检但跟踪中的目标
+    // C-BIoU 低置信度检测阈值（第二阶段救援），用于"救活"被遮挡/漏检但跟踪中的目标
     private static final float BYTETRACK_LOW_CONF = 0.1f;
-    // 第二阶段（低置信度 + 已跟踪目标）的 IoU 匹配阈值，比正常更宽松，允许部分漏检
-    private static final float BYTETRACK_LOW_IOU = -0.05f;
     private float MIN_AREA_THRESHOLD = 0.01f;
     // 距离准星（屏幕中心）的高斯权重标准差（归一化，越大锁定范围越宽）
     private float CENTER_SIGMA = 0.2f;
@@ -97,7 +95,16 @@ public class PoseEstimator {
     // 论文默认 60 帧（≈2秒），但游戏场景目标短暂出框/被遮挡后通常 1 秒内回归
     // 过短（原 20 帧=0.67 秒）会导致目标短暂闪身后回来重新锁定慢
     private int MAX_TRACK_LOST = 30;
-    private float TRACK_IOU_THRESHOLD = 0.1f;
+    // C-BIoU Tracker（roboflow 2026 benchmark, HOTA 63.0 > OC-SORT 61.9）
+    // 替代 ByteTrack 纯 EIoU 匹配：buffer 扩展（中心不变，宽高×(1+2*buf)）后再算 IoU，
+    // 解决 FPS 横向快速移动时纯 IoU 骤降断锁。两阶段 buffer/阈值不同：
+    //   HIGH 阶段：小 buffer(0.3)+低阈值(0.2)，高速仍能匹配
+    //   LOW 救援：大 buffer(0.5)+阈值(0.3)，放宽匹配容许遮挡漂移
+    // HIGH 阶段 buffered IoU 阈值
+    private float TRACK_IOU_THRESHOLD = 0.2f;
+    private float CBIoU_BUF_HIGH = 0.3f;   // HIGH 阶段 buffer 扩展比例
+    private float CBIoU_BUF_LOW = 0.5f;    // LOW 救援 buffer 扩展比例
+    private float CBIoU_IOU_LOW = 0.3f;    // LOW 救援 buffered IoU 阈值
     // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
     // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
     private static final float EXPAND_RATIO = 0.15f;
@@ -224,7 +231,10 @@ public class PoseEstimator {
         CONFIDENCE_THRESHOLD = parseFloat(prefs, "det_conf", 0.15f);
         VALID_DETECTION_CONF = parseFloat(prefs, "det_valid", 0.2f);
         MIN_AREA_THRESHOLD = parseFloat(prefs, "det_min_area", 0.01f);
-        TRACK_IOU_THRESHOLD = parseFloat(prefs, "track_iou", 0.1f);
+        TRACK_IOU_THRESHOLD = parseFloat(prefs, "track_iou", 0.2f);
+        CBIoU_BUF_HIGH = parseFloat(prefs, "track_buf_high", 0.3f);
+        CBIoU_BUF_LOW = parseFloat(prefs, "track_buf_low", 0.5f);
+        CBIoU_IOU_LOW = parseFloat(prefs, "track_iou_low", 0.3f);
         MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
         TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
         PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f);
@@ -576,10 +586,10 @@ public class PoseEstimator {
                 // 组合：score = (1-W)*dist + W*angle，距离为主角度为辅
                 float posWeight = (1f - SCORE_W) * distWeight + SCORE_W * angleWeight;
 
-                // 跟踪加分用"预测后的 trackedBox"做 IoU
+                // C-BIoU：跟踪加分用预测后的 trackedBox 做 buffered IoU（HIGH 阶段）
                 float trackBonus = 1.0f;
                 boolean matched = predTracked != null
-                        && boxEIoU(predTracked, box) >= TRACK_IOU_THRESHOLD;
+                        && bufferedIoU(predTracked, box, CBIoU_BUF_HIGH) >= TRACK_IOU_THRESHOLD;
                 if (matched) {
                     trackBonus = TRACK_BONUS;
                 }
@@ -607,19 +617,18 @@ public class PoseEstimator {
             }
         }
 
-        // ===== ByteTrack 第二阶段：如果已跟踪目标在 HIGH 阶段没匹配到，用 LOW 集合救援 =====
+        // ===== C-BIoU 第二阶段：已跟踪目标在 HIGH 阶段没匹配到，用 LOW 集合救援 =====
+        // LOW 用更大 buffer(0.5) 扩展 + 阈值(0.3)：放宽匹配容许遮挡漂移
         boolean rescuedByLow = false;
         if (trackedBox != null && !bestMatchedTrack && lowCount > 0) {
-            // 注意：boxEIoU 可能为负（不重叠但近邻的小目标），初始值需低于 BYTETRACK_LOW_IOU
-            // 原 0f 会阻止所有 EIoU<0 的 LOW 候选匹配，与宽松阈值 -0.05 的设计意图不符
+            // C-BIoU LOW 阈值为正数(0.3)，初始 -1 兜底
             float bestLowIoU = -1f;
             float[] bestLowBox = null;
             for (int i = 0; i < lowCount; i++) {
                 float[] lb = lowBoxes[i];
                 float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
-                float iou = boxEIoU(predTracked, lbBox);
-                // LOW 阶段 IoU 阈值更宽松（0.1），允许框质量差但位置大致对得上
-                if (iou >= BYTETRACK_LOW_IOU && iou > bestLowIoU) {
+                float iou = bufferedIoU(predTracked, lbBox, CBIoU_BUF_LOW);
+                if (iou >= CBIoU_IOU_LOW && iou > bestLowIoU) {
                     bestLowIoU = iou;
                     bestLowBox = lbBox;
                 }
@@ -731,12 +740,48 @@ public class PoseEstimator {
     }
 
     /**
+     * C-BIoU（Buffered IoU）：中心不变，宽高 ×(1+2*bufRatio) 扩展后再算标准 IoU。
+     * 论文 roboflow 2026 benchmark：HOTA 63.0 > OC-SORT 61.9。
+     * 相比 EIoU 的优势：无中心距离惩罚，纯靠 buffer 扩展提升快速横向移动时的重叠率，
+     * 避免 FPS 开镜横移时 predTracked 与 det 框中心距离大导致 EIoU 分数被 ρ²/c² 拖低而失配。
+     * bufRatio 由调用方传入（HIGH 阶段 0.3，LOW 救援 0.5），实现两阶段差异化匹配。
+     * 内联实现，零内存分配。
+     */
+    private float bufferedIoU(float[] boxA, float[] boxB, float bufRatio) {
+        // 两框按 bufRatio 向外扩展（中心不变）
+        float aW = boxA[2] * (1f + 2f * bufRatio);
+        float aH = boxA[3] * (1f + 2f * bufRatio);
+        float bW = boxB[2] * (1f + 2f * bufRatio);
+        float bH = boxB[3] * (1f + 2f * bufRatio);
+
+        float ax1 = boxA[0] - aW / 2f;
+        float ay1 = boxA[1] - aH / 2f;
+        float ax2 = boxA[0] + aW / 2f;
+        float ay2 = boxA[1] + aH / 2f;
+        float bx1 = boxB[0] - bW / 2f;
+        float by1 = boxB[1] - bH / 2f;
+        float bx2 = boxB[0] + bW / 2f;
+        float by2 = boxB[1] + bH / 2f;
+
+        // 交集
+        float iw = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+        float ih = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+        float inter = iw * ih;
+
+        // 并集与 IoU
+        float union = aW * aH + bW * bH - inter;
+        return union > 0 ? inter / union : 0;
+    }
+
+    /**
+     * @deprecated 已由 C-BIoU {@link #bufferedIoU} 替代，保留以便回退对比。
      * 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：
      * 在 EIoU 基础上对两框各方向扩展 EXPAND_RATIO 后计算 IoU，再叠加中心距离惩罚。
      * - bbox 扩展提升小目标重叠率（远处小人仅几像素位移 IoU 不再骤降为 0）
      * - 中心距离惩罚 ρ²/c² 对近邻但不重叠的框仍给出非零相似度，避免跟踪断锁
      * 整体内联实现，零内存分配，避免 GC 压力。
      */
+    @Deprecated
     private float boxEIoU(float[] boxA, float[] boxB) {
         // 扩展两框：中心不变，宽高 × (1 + 2*EXPAND_RATIO)
         float eaW = boxA[2] * (1f + 2f * EXPAND_RATIO);
