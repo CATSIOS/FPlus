@@ -303,11 +303,30 @@ public class PoseEstimator {
     }
 
     private void updateRoiCenter(float targetCx, float targetCy) {
-        int half = roiSize / 2;
-        int newX = (int) (targetCx - half);
-        int newY = (int) (targetCy - half);
-        roiX = Math.max(0, Math.min(originalWidth - roiSize, newX));
-        roiY = Math.max(0, Math.min(originalHeight - roiSize, newY));
+        float curCx = roiX + roiSize / 2f;
+        float curCy = roiY + roiSize / 2f;
+        float dx = targetCx - curCx;
+        float dy = targetCy - curCy;
+        float dist = (float) Math.sqrt(dx * dx + dy * dy);
+
+        // 死区：目标在 ROI 中心 15% 范围内不移动，减少黄框抖动
+        float deadZone = roiSize * 0.15f;
+        if (dist <= deadZone) return;
+
+        // 非线性跟随：超出死区部分按平方根缩放
+        // 目标离中心越远跟随幅度越大，但始终小于实际位移；单帧最大移动 20% ROI
+        float excess = dist - deadZone;
+        float ratio = excess / dist;
+        float scale = (float) Math.sqrt(ratio);
+        float maxMove = roiSize * 0.2f;
+        float move = Math.min(excess * scale, maxMove);
+        float moveX = dx / dist * move;
+        float moveY = dy / dist * move;
+
+        float newCx = curCx + moveX;
+        float newCy = curCy + moveY;
+        roiX = (int) Math.max(0, Math.min(originalWidth - roiSize, newCx - roiSize / 2f));
+        roiY = (int) Math.max(0, Math.min(originalHeight - roiSize, newCy - roiSize / 2f));
     }
 
     private Bitmap preprocessBitmap(Bitmap source) {
