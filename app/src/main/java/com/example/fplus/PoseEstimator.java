@@ -36,6 +36,11 @@ public class PoseEstimator {
     private static final float MIN_AREA_THRESHOLD = 0.01f;
     // 距离准星（屏幕中心）的高斯权重标准差（归一化，越大锁定范围越宽）
     private static final float CENTER_SIGMA = 0.2f;
+    // 方案3：水平偏心角度分数（FPS 横向瞄准是关键，垂直偏心不惩罚）
+    // 借鉴 Best Target Selection (Nicholas Gorski) 的"距离+角度"组合评分
+    private static final float ANGLE_SIGMA = 0.25f;
+    // 评分组合权重：score = (1-W)*distWeight + W*angleWeight
+    private static final float SCORE_W = 0.3f;
     // 当前锁定目标的连续性加成倍数（防止多目标间来回跳）
     private static final float TRACK_BONUS = 2.0f;
     // 接管阈值：新目标置信度 ≥ 此值时绕过 anti-lock-jump 保护，立即切换锁定
@@ -98,7 +103,12 @@ public class PoseEstimator {
     private float trackVelX = 0f;
     private float trackVelY = 0f;
     private long lastTrackTimeNanos = 0L;
-    private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数
+    private static final float VEL_EMA_ALPHA = 0.5f; // 速度 EMA 平滑系数（大目标基准）
+    // 方案1：Area-Adaptive Motion Damping（AKKF, arxiv 2607.12544）
+    // 小目标速度噪声相对更大（几像素抖动=大比例位移），应增大阻尼降低 EMA alpha
+    // area_norm >= AREA_NORM_REF 时 alpha = VEL_EMA_ALPHA，面积越小 alpha 越接近 ALPHA_MIN
+    private static final float VEL_ALPHA_MIN = 0.3f;
+    private static final float AREA_NORM_REF = 0.05f;
 
     // 预测未来位置（借鉴 Sunone Aimbot / Aimmy Kalman Lead Time）
     // PREDICT_SECONDS：绿框显示位置外推的提前量（秒）
@@ -512,6 +522,13 @@ public class PoseEstimator {
                 float distWeight = (float) Math.exp(-(distToCenter * distToCenter)
                         / (2 * CENTER_SIGMA * CENTER_SIGMA));
 
+                // 方案3：水平偏心角度分数（Best Target Selection, Nicholas Gorski）
+                // FPS 横向瞄准是关键，垂直偏心不惩罚（敌人可能在上下半部分）
+                float angleWeight = (float) Math.exp(-(dx * dx)
+                        / (2 * ANGLE_SIGMA * ANGLE_SIGMA));
+                // 组合：score = (1-W)*dist + W*angle，距离为主角度为辅
+                float posWeight = (1f - SCORE_W) * distWeight + SCORE_W * angleWeight;
+
                 // 跟踪加分用"预测后的 trackedBox"做 IoU
                 float trackBonus = 1.0f;
                 boolean matched = predTracked != null
@@ -520,7 +537,7 @@ public class PoseEstimator {
                     trackBonus = TRACK_BONUS;
                 }
 
-                float score = boxConf * distWeight * trackBonus;
+                float score = boxConf * posWeight * trackBonus;
                 if (score > maxScore) {
                     maxScore = score;
                     bestConf = boxConf;
@@ -619,8 +636,16 @@ public class PoseEstimator {
                     if (framesElapsed < 0.5) framesElapsed = 0.5;
                     float rawVx = (newBox[0] - trackedBox[0]) / (float) framesElapsed;
                     float rawVy = (newBox[1] - trackedBox[1]) / (float) framesElapsed;
-                    trackVelX = (1 - VEL_EMA_ALPHA) * trackVelX + VEL_EMA_ALPHA * rawVx;
-                    trackVelY = (1 - VEL_EMA_ALPHA) * trackVelY + VEL_EMA_ALPHA * rawVy;
+                    // 方案1：Area-Adaptive Motion Damping（AKKF, arxiv 2607.12544）
+                    // 小目标面积小，几像素抖动=大比例位移噪声，增大阻尼降低 alpha
+                    // 大目标面积大，速度估计可靠，alpha 保持基准值
+                    float areaNorm = (trackedBox[2] * trackedBox[3])
+                            / (originalWidth * originalHeight);
+                    float adaptiveAlpha = VEL_ALPHA_MIN
+                            + (VEL_EMA_ALPHA - VEL_ALPHA_MIN)
+                            * Math.min(1f, areaNorm / AREA_NORM_REF);
+                    trackVelX = (1 - adaptiveAlpha) * trackVelX + adaptiveAlpha * rawVx;
+                    trackVelY = (1 - adaptiveAlpha) * trackVelY + adaptiveAlpha * rawVy;
                 }
             }
             trackedBox = newBox;
