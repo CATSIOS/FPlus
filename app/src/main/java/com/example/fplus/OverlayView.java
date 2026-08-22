@@ -124,13 +124,20 @@ public class OverlayView extends View {
                     lostAtNanos = timestampNanos;
                 }
                 long elapsed = timestampNanos - lostAtNanos;
-                if (elapsed >= FADE_DURATION_NANOS) {
+                if (elapsed <= 0) {
+                    // 时间戳倒转/同帧：兜底保持当前透明度（不超过255）
+                    if (fadeAlpha > 255) fadeAlpha = 255;
+                    if (fadeAlpha < 0) fadeAlpha = 0;
+                } else if (elapsed >= FADE_DURATION_NANOS) {
                     displayBox = null;
                     fadeAlpha = 255;
                     lostAtNanos = 0;
                 } else {
-                    // 按真实时长线性淡出：从 255 到 0
-                    fadeAlpha = 255 - (int) (255L * elapsed / FADE_DURATION_NANOS);
+                    // 按真实时长线性淡出：从 255 到 0，严格 clamp 防溢出
+                    int alpha = 255 - (int) (255L * elapsed / FADE_DURATION_NANOS);
+                    if (alpha < 0) alpha = 0;
+                    if (alpha > 255) alpha = 255;
+                    fadeAlpha = alpha;
                 }
             } else {
                 lostAtNanos = 0;

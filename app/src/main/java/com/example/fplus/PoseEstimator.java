@@ -725,9 +725,13 @@ public class PoseEstimator {
             CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET * mult;
             CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
             // 变化过小不重建（256次浮点虽快，但没必要每帧做）
-            boolean needRebuild = (lastRebuildGain < 0f)
-                    || Math.abs(CUR_BRIGHT_GAIN / lastRebuildGain - 1f) > REBUILD_GAIN_RATIO
-                    || Math.abs(CUR_BRIGHT_OFFSET - lastRebuildOffset) > REBUILD_OFFSET_ABS;
+            // lastRebuildGain < 0 表示首次（必重建）；增益接近 0 时改用绝对差避免除零
+            boolean gainChanged = (lastRebuildGain < 0f)
+                    || (Math.abs(lastRebuildGain) < 1e-4f
+                        ? Math.abs(CUR_BRIGHT_GAIN - lastRebuildGain) > REBUILD_GAIN_RATIO * 0.5f
+                        : Math.abs(CUR_BRIGHT_GAIN / lastRebuildGain - 1f) > REBUILD_GAIN_RATIO);
+            boolean offsetChanged = Math.abs(CUR_BRIGHT_OFFSET - lastRebuildOffset) > REBUILD_OFFSET_ABS;
+            boolean needRebuild = gainChanged || (lastRebuildOffset < 0f) || offsetChanged;
             if (needRebuild) {
                 rebuildBrightLut();
                 lastRebuildGain = CUR_BRIGHT_GAIN;
@@ -1120,9 +1124,11 @@ public class PoseEstimator {
             for (int i = 0; i < lowCount; i++) {
                 float[] lb = lowBoxes[i];
                 float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
-                float iou = bufferedIoU(predTracked, lbBox, CBIoU_BUF_LOW);
-                if (iou >= CBIoU_IOU_LOW && iou > bestLowIoU) {
-                    bestLowIoU = iou;
+                // LOW 救援与 HIGH 一致用 simTrack：bufferedIoU + 距离补分 + 高度相似性
+                // simTrack >= bufferedIoU，阈值保持 CBIoU_IOU_LOW 等效放宽，与 HIGH 策略对齐
+                float sim = simTrack(predTracked, lbBox, CBIoU_BUF_LOW);
+                if (sim >= CBIoU_IOU_LOW && sim > bestLowIoU) {
+                    bestLowIoU = sim;
                     bestLowBox = lbBox;
                 }
             }
@@ -1152,9 +1158,11 @@ public class PoseEstimator {
             for (int i = 0; i < lowCount; i++) {
                 float[] lb = lowBoxes[i];
                 float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
-                float iou = bufferedIoU(predTracked, lbBox, RECOVERY_BUF);
-                if (iou >= RECOVERY_IOU && iou > bestRecoveryIoU) {
-                    bestRecoveryIoU = iou;
+                // Recovery 阶段同样用 simTrack：宽缓冲 + 距离补分 + 高度相似性，
+                // 与 HIGH/LOW 策略一致，进一步提高短遮挡场景的恢复率
+                float sim = simTrack(predTracked, lbBox, RECOVERY_BUF);
+                if (sim >= RECOVERY_IOU && sim > bestRecoveryIoU) {
+                    bestRecoveryIoU = sim;
                     bestRecoveryBox = lbBox;
                 }
             }
@@ -1547,5 +1555,24 @@ public class PoseEstimator {
             scaledRoi.recycle();
             scaledRoi = null;
         }
+        // 清空所有引用类型字段，避免 GC 根链上残留（close 后 PoseEstimator 实例本就该废弃）
+        inputBuffer = null;
+        inputFloatBuffer = null;
+        inputFloats = null;
+        pixels = null;
+        pixelBytes = null;
+        pixelCopyBuffer = null;
+        brightLut = null;
+        scaleCanvas = null;
+        scalePaint = null;
+        scaleRect = null;
+        scaleSrcRect = null;
+        output = null;
+        trackedBox = null;
+        originalWidth = 0;
+        originalHeight = 0;
+        roiX = 0;
+        roiY = 0;
+        roiSize = 0;
     }
 }
