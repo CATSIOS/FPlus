@@ -357,6 +357,9 @@ public class PoseEstimator {
     private boolean tryCreateInterpreter(MappedByteBuffer modelBuffer, Backend backend) {
         Interpreter.Options options = new Interpreter.Options();
         options.setNumThreads(4);
+        // 禁用 XNNPACK delegate fallback：GPU delegate 不受支持的算子回落到 XNNPACK CPU 反而更慢
+        // （TFLite 2.14+ 默认 XNNPACK，与 GPU delegate 叠加时可能拖慢；显式 false 强制纯 CPU fallback）
+        options.setUseXNNPACK(false);
 
         if (backend == Backend.GPU) {
             try {
@@ -365,8 +368,15 @@ public class PoseEstimator {
                     Log.w(TAG, "GPU delegate 不受支持");
                     return false;
                 }
-                gpuDelegate = new GpuDelegate();
+                // 显式配置 GpuDelegate.Options：避免不同 TFLite 版本默认值差异
+                GpuDelegate.Options gOpts = new GpuDelegate.Options();
+                // FAST_SINGLE_ANSWER：低延迟优先（SUSTAINED_SPEED 反而增加小模型开销，项目记忆已确认）
+                gOpts.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_FAST_SINGLE_ANSWER);
+                // 关闭精度损失：禁止 GPU 自动将 FP32 降为 FP16（项目记忆确认精度损失不允许）
+                gOpts.setPrecisionLossAllowed(false);
+                gpuDelegate = new GpuDelegate(gOpts);
                 options.addDelegate(gpuDelegate);
+                Log.d(TAG, "GPU delegate: FAST_SINGLE_ANSWER + PrecisionLoss=off + XNNPACK=off");
             } catch (Throwable t) {
                 Log.w(TAG, "创建 GPU delegate 失败", t);
                 closeHardwareDelegate();
@@ -400,14 +410,19 @@ public class PoseEstimator {
     private boolean tryCreateInterpreter2(MappedByteBuffer modelBuffer) {
         Interpreter.Options options = new Interpreter.Options();
         options.setNumThreads(4);
+        options.setUseXNNPACK(false);
         try {
             CompatibilityList cl = new CompatibilityList();
             if (!cl.isDelegateSupportedOnThisDevice()) {
                 Log.w(TAG, "[2nd] GPU delegate 不受支持，双实例禁用");
                 return false;
             }
-            gpuDelegate2 = new GpuDelegate();
+            GpuDelegate.Options gOpts = new GpuDelegate.Options();
+            gOpts.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_FAST_SINGLE_ANSWER);
+            gOpts.setPrecisionLossAllowed(false);
+            gpuDelegate2 = new GpuDelegate(gOpts);
             options.addDelegate(gpuDelegate2);
+            Log.d(TAG, "[2nd] GPU delegate: FAST_SINGLE_ANSWER + PrecisionLoss=off + XNNPACK=off");
         } catch (Throwable t) {
             Log.w(TAG, "[2nd] 创建 GPU delegate 失败", t);
             closeSecondHardwareDelegate();
