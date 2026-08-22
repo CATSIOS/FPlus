@@ -145,6 +145,10 @@ public class PoseEstimator {
     // HIGH 阶段 buffered IoU 阈值
     private float TRACK_IOU_THRESHOLD = 0.2f;
     private float CBIoU_BUF_HIGH = 0.3f;   // HIGH 阶段 buffer 扩展比例
+    // HIGH 检测框 NMS 去重 IoU 阈值：同一个目标 YOLO 常出 2~3 个重叠高分框，
+    // 不处理会导致 OAM occlusion 把 1 人误判成 3 人遮挡 → BAM 不信任观测 → 跟踪漂移。
+    // 0.8 严格重叠，同目标重复框必压，多人物不互压
+    private static final float HIGH_NMS_IOU_THRESH = 0.8f;
     private float CBIoU_BUF_LOW = 0.5f;    // LOW 救援 buffer 扩展比例
     private float CBIoU_IOU_LOW = 0.3f;    // LOW 救援 buffered IoU 阈值
     // 速度自适应 buffer：速度归一化（速度/框宽）达到此值时 HIGH buffer 放大到 LOW 上限
@@ -845,8 +849,10 @@ public class PoseEstimator {
         lowBoxes = new float[lowCap][];
 
         // OA-SORT OAM：收集 HIGH 检测框用于 bestPose 遮挡系数计算
+        // highConfs 并行存置信度：NMS 去重需要按置信度排序压低分框
         int highCap = 32;
         float[][] highBoxes = new float[highCap][];
+        float[] highConfs = new float[highCap];
         int highCount = 0;
 
         // ===== OC-SORT OCM：先对 trackedBox 做基于速度的位置外推 =====
@@ -923,14 +929,20 @@ public class PoseEstimator {
                 float[] box = new float[]{px, py, pw, ph};
 
                 // OA-SORT OAM：收集 HIGH 检测框，bestPose 选出后用于计算被遮挡系数
+                // highConfs 并行存置信度（NMS 去重要用）
                 if (highCount >= highCap) {
                     int newHighCap = highCap * 2;
                     float[][] newHigh = new float[newHighCap][];
                     System.arraycopy(highBoxes, 0, newHigh, 0, highCap);
                     highBoxes = newHigh;
+                    float[] newConfs = new float[newHighCap];
+                    System.arraycopy(highConfs, 0, newConfs, 0, highCap);
+                    highConfs = newConfs;
                     highCap = newHighCap;
                 }
-                highBoxes[highCount++] = box;
+                highBoxes[highCount] = box;
+                highConfs[highCount] = boxConf;
+                highCount++;
 
                 float dx = (px - originalWidth / 2f) / originalWidth;
                 float dy = (py - originalHeight / 2f) / originalHeight;
@@ -974,6 +986,47 @@ public class PoseEstimator {
                 }
                 lowBoxes[lowCount++] = new float[]{px, py, pw, ph, boxConf};
             }
+        }
+
+        // ===== HIGH 检测框 NMS 去重（方案 A）=====
+        // YOLO 对同一目标常产生 2~3 个重叠高分框，不处理会被 OAM 当成"多人遮挡" →
+        // BAM 过度降低观测信任 → 跟踪靠预测漂移。O(n²) 两两比对：IoU≥0.8 的重叠对，
+        // 压掉低分那个；最后 compact 回 highBoxes 开头，highCount 更新为去重后数量。
+        // 仅影响 OAM occlusion 计算；选主逻辑（bestPose 遍历中已选好）不变。
+        if (highCount > 1) {
+            boolean[] suppressed = new boolean[highCount];
+            for (int i = 0; i < highCount; i++) {
+                if (suppressed[i]) continue;
+                for (int j = i + 1; j < highCount; j++) {
+                    if (suppressed[j]) continue;
+                    float ov = boxIou(highBoxes[i], highBoxes[j]);
+                    if (ov >= HIGH_NMS_IOU_THRESH) {
+                        // IoU 够大，压掉置信度低的那个
+                        if (highConfs[i] >= highConfs[j]) {
+                            suppressed[j] = true;
+                        } else {
+                            suppressed[i] = true;
+                            break; // i 被压了，不用再比 i 后面
+                        }
+                    }
+                }
+            }
+            // 把未被压制的框从前往后紧凑挪
+            int nmsCount = 0;
+            for (int i = 0; i < highCount; i++) {
+                if (!suppressed[i]) {
+                    if (nmsCount != i) { // 非原地才搬（原地正确位置）
+                        highBoxes[nmsCount] = highBoxes[i];
+                        highConfs[nmsCount] = highConfs[i];
+                    }
+                    nmsCount++;
+                }
+            }
+            // 末尾的引用置空，避免 GC 认为旧框还活着（虽然是局部栈，但安全清理）
+            for (int i = nmsCount; i < highCount; i++) {
+                highBoxes[i] = null;
+            }
+            highCount = nmsCount;
         }
 
         // ===== C-BIoU 第二阶段：已跟踪目标在 HIGH 阶段没匹配到，用 LOW 集合救援 =====
