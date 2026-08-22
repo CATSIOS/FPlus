@@ -58,9 +58,24 @@ public class PoseEstimator {
     private static final float RECENTER_SMOOTH = 0.2f;
     private static final float INV_255 = 1f / 255f;
     // 亮度/对比度增强：游戏场景偏暗，提亮有助于提升检测率
-    private float BRIGHTNESS_GAIN = 1.3f;   // 对比度增益
-    private float BRIGHTNESS_OFFSET = 25f;  // 亮度偏移（0~255）
-    private float BRIGHTNESS_OFFSET_NORM;  // 派生：构造时从 BRIGHTNESS_OFFSET 计算
+    // USER_* = 高级选项用户手动设置的基础值；CUR_* = 当前帧实际应用值（USER_* 乘动态补偿倍率 mult）
+    private float USER_BRIGHT_GAIN = 1.3f;
+    private float USER_BRIGHT_OFFSET = 25f;
+    private float CUR_BRIGHT_GAIN = 1.3f;
+    private float CUR_BRIGHT_OFFSET = 25f;
+    private float CUR_BRIGHT_OFFSET_NORM;
+    // 动态亮度配置：目标平均亮度(0~255)、EMA平滑系数、重建LUT的变化阈值、补偿倍率上下限
+    private static final float TARGET_AVG_LUMA = 90f;
+    private static final float LUM_EMA_ALPHA = 0.3f;
+    private static final float REBUILD_GAIN_RATIO = 0.05f;  // ±5% 变化才重建 LUT
+    private static final float REBUILD_OFFSET_ABS = 3.0f;    // 绝对值±3 才重建
+    private static final float MIN_MULT = 0.75f;
+    private static final float MAX_MULT = 1.8f;
+    // 动态亮度状态字段
+    private float emaAvgL = -1f;  // -1 表示未初始化
+    private float lastRebuildGain = -1f;
+    private float lastRebuildOffset = -1f;
+    private boolean dynBrightComputed = false;
 
     private Interpreter interpreter;
     private GpuDelegate gpuDelegate;
@@ -334,9 +349,14 @@ public class PoseEstimator {
         CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f);
         SCORE_W = parseFloat(prefs, "score_w", 0.3f);
         ROI_SCALE = parseFloat(prefs, "roi_scale", 0.7f);
-        BRIGHTNESS_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
-        BRIGHTNESS_OFFSET = parseFloat(prefs, "bright_offset", 25f);
-        BRIGHTNESS_OFFSET_NORM = BRIGHTNESS_OFFSET * INV_255;
+        USER_BRIGHT_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
+        USER_BRIGHT_OFFSET = parseFloat(prefs, "bright_offset", 25f);
+        CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN;
+        CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET;
+        CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
+        emaAvgL = -1f;                 // 重置 EMA，下一帧按新场景重新收敛
+        lastRebuildGain = -1f;         // 下一次必触发 rebuildBrightLut（用新 CUR_*）
+        lastRebuildOffset = -1f;
         rebuildBrightLut();  // 亮度参数变化后重建 LUT，convert 遍历用查表替代浮点乘加
         // 双实例并发 PoC 开关（"1"=开），zoom 比例
         DUAL_INFER_ENABLED = "1".equals(prefs.getString("dual_infer", "0"));
@@ -496,6 +516,8 @@ public class PoseEstimator {
     public PersonPose estimate(Bitmap bitmap) {
         originalWidth = bitmap.getWidth();
         originalHeight = bitmap.getHeight();
+        // 动态亮度：每帧重置标记，主路 bitmapToByteBuffer 只计算一次（第二路复用主路结果）
+        dynBrightComputed = false;
 
         long t0 = System.nanoTime();
         Bitmap resizedBitmap = preprocessBitmap(bitmap);
@@ -672,6 +694,48 @@ public class PoseEstimator {
         pixelCopyBuffer.rewind();
         pixelCopyBuffer.get(pixelBytes, 0, byteLen);
 
+        // ===== 动态亮度增益：抽样算平均亮度 → EMA → mult → 超阈值重建 LUT（每帧主路只算一次）=====
+        if (!dynBrightComputed) {
+            long sumL = 0;
+            int sampleCount = 0;
+            int rowStep = 4;  // 每 4 行抽 1 行，每 4 列抽 1 列 = 抽样率 1/16
+            int colStep = 4;
+            int w4 = width * 4;
+            for (int y = 0; y < height; y += rowStep) {
+                int rowOff = y * w4;
+                for (int x = 0; x < width; x += colStep) {
+                    int idx = rowOff + x * 4;
+                    int r = pixelBytes[idx] & 0xFF;
+                    int g = pixelBytes[idx + 1] & 0xFF;
+                    int b = pixelBytes[idx + 2] & 0xFF;
+                    // 标准 CCIR 601 luma = 0.299R + 0.587G + 0.114B（用整数乘避免浮点）
+                    sumL += (299 * r + 587 * g + 114 * b) / 1000;
+                    sampleCount++;
+                }
+            }
+            int avgL = sampleCount > 0 ? (int) (sumL / sampleCount) : 128;
+            // EMA 平滑，防止帧间小抖动导致 GAIN 跳变
+            if (emaAvgL < 0f) emaAvgL = avgL;
+            else emaAvgL = emaAvgL + LUM_EMA_ALPHA * (avgL - emaAvgL);
+            // 补偿倍率：想把平均亮度拉到 TARGET_AVG_LUMA，暗画面 mult > 1，亮画面 mult < 1
+            float mult = TARGET_AVG_LUMA / (emaAvgL + 8f);
+            if (mult < MIN_MULT) mult = MIN_MULT;
+            else if (mult > MAX_MULT) mult = MAX_MULT;
+            CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN * mult;
+            CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET * mult;
+            CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
+            // 变化过小不重建（256次浮点虽快，但没必要每帧做）
+            boolean needRebuild = (lastRebuildGain < 0f)
+                    || Math.abs(CUR_BRIGHT_GAIN / lastRebuildGain - 1f) > REBUILD_GAIN_RATIO
+                    || Math.abs(CUR_BRIGHT_OFFSET - lastRebuildOffset) > REBUILD_OFFSET_ABS;
+            if (needRebuild) {
+                rebuildBrightLut();
+                lastRebuildGain = CUR_BRIGHT_GAIN;
+                lastRebuildOffset = CUR_BRIGHT_OFFSET;
+            }
+            dynBrightComputed = true;
+        }
+
         int total = len * 3;
         if (inputFloats == null || inputFloats.length != total) {
             inputFloats = new float[total];
@@ -821,14 +885,16 @@ public class PoseEstimator {
         return best;
     }
 
-    /** 重建亮度查表（GAIN/OFFSET 变化时调用）：brightLut[v]=clamp(v*INV_255*GAIN+OFFSET_NORM) */
+    /** 重建亮度查表（GAIN/OFFSET 变化时调用）：brightLut[v]=clamp(v*INV_255*CUR_GAIN+CUR_OFFSET_NORM) */
     private void rebuildBrightLut() {
         if (brightLut == null || brightLut.length != 256) {
             brightLut = new float[256];
         }
+        float curGain = CUR_BRIGHT_GAIN;
+        float curOffNorm = CUR_BRIGHT_OFFSET_NORM;
         for (int i = 0; i < 256; i++) {
             float v = i * INV_255;
-            v = v * BRIGHTNESS_GAIN + BRIGHTNESS_OFFSET_NORM;
+            v = v * curGain + curOffNorm;
             if (v < 0f) v = 0f;
             else if (v > 1f) v = 1f;
             brightLut[i] = v;
@@ -836,7 +902,7 @@ public class PoseEstimator {
     }
 
     private float brighten(float v) {
-        v = v * BRIGHTNESS_GAIN + BRIGHTNESS_OFFSET_NORM;
+        v = v * CUR_BRIGHT_GAIN + CUR_BRIGHT_OFFSET_NORM;
         // clamp 到 [0,1]：用户在高级选项可能输入负 BRIGHTNESS_OFFSET，
         // 不 clamp 下界会让模型输入出现负值，产生异常输出
         if (v < 0f) return 0f;
