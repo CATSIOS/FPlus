@@ -149,6 +149,21 @@ public class PoseEstimator {
     // 不处理会导致 OAM occlusion 把 1 人误判成 3 人遮挡 → BAM 不信任观测 → 跟踪漂移。
     // 0.8 严格重叠，同目标重复框必压，多人物不互压
     private static final float HIGH_NMS_IOU_THRESH = 0.8f;
+
+    // 方案 A：MeMoSORT Mo-IoU（ICLR 2026 Submission，DanceTrack HOTA 67.9）的高度相似性分量。
+    // 同一人物高度不会突变：横向快移时高度比例一致（0~1的heightSim）加分，
+    // 高度差异大（比如旁边另一个人身高明显不同）减分，降低横向重叠时的错匹配。
+    // 叠加到 simTrack，高度完全一致（heightSim=1）加 HEIGHT_SIM_WEIGHT，
+    // 完全不一致（heightSim=0，高度>2倍差）加 0。
+    private static final float HEIGHT_SIM_WEIGHT = 0.2f;
+
+    // 方案 B：OATrack（Sensors 2026，UAV 小目标场景）三阶段渐进分配第三阶段「刚丢失回收」。
+    // LOW 救援失败后：trackLostFrames∈[1, RECOVERY_MAX_FRAMES] 的目标去 LOW 集合里
+    // 用更宽缓冲(RECOVERY_BUF=0.7)和宽松阈值(RECOVERY_IOU=0.2)再扫一次，
+    // 专救"短暂出框1~3帧又回来"Coast经常失效的场景。IDSW -69%（VisDrone 论文数据）。
+    private static final int RECOVERY_MAX_FRAMES = 3;
+    private static final float RECOVERY_BUF = 0.7f;
+    private static final float RECOVERY_IOU = 0.2f;
     private float CBIoU_BUF_LOW = 0.5f;    // LOW 救援 buffer 扩展比例
     private float CBIoU_IOU_LOW = 0.3f;    // LOW 救援 buffered IoU 阈值
     // 速度自适应 buffer：速度归一化（速度/框宽）达到此值时 HIGH buffer 放大到 LOW 上限
@@ -1057,6 +1072,35 @@ public class PoseEstimator {
             }
         }
 
+        // ===== 方案 B：OATrack 三阶段回收（最近丢失恢复） =====
+        // LOW 救援失败后，若 trackLostFrames ∈ [1, RECOVERY_MAX_FRAMES]（短期刚丢），
+        // 用更宽缓冲(RECOVERY_BUF=0.7)+更低阈值(RECOVERY_IOU=0.2)再扫一次 LOW 集合。
+        // 设计意图：目标被短暂遮挡（1~3帧），Coast 外推位置与真实检测位置错位较大，
+        // LOW 阶段因阈值/buffer不够宽而漏掉；此处进一步放宽条件，优先恢复"最近还在跟踪"的目标，
+        // 而不是让 MAX_TRACK_LOST(30帧) 倒计时走完或被其他高分框抢走锁定。
+        if (trackedBox != null && !bestMatchedTrack && !rescuedByLow
+                && trackLostFrames >= 1 && trackLostFrames <= RECOVERY_MAX_FRAMES
+                && lowCount > 0) {
+            float bestRecoveryIoU = -1f;
+            float[] bestRecoveryBox = null;
+            for (int i = 0; i < lowCount; i++) {
+                float[] lb = lowBoxes[i];
+                float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
+                float iou = bufferedIoU(predTracked, lbBox, RECOVERY_BUF);
+                if (iou >= RECOVERY_IOU && iou > bestRecoveryIoU) {
+                    bestRecoveryIoU = iou;
+                    bestRecoveryBox = lbBox;
+                }
+            }
+            if (bestRecoveryBox != null) {
+                bestPose = new PersonPose();
+                bestPose.box = bestRecoveryBox;
+                bestConf = VALID_DETECTION_CONF;
+                rescuedByLow = true;
+                bestMatchedTrack = true;
+            }
+        }
+
         // HIGH 阶段若已选到"非跟踪目标"的高分框（例如画面边缘另一个人突然出现），
         // 但当前仍在锁定中，我们不应该抢走锁定。逻辑：在 trackedBox 仍有效（lostFrames 不大）
         // 情况下，如果 bestMatchedTrack == false 说明 HIGH 选的不是当前目标，保持旧 trackedBox
@@ -1226,7 +1270,15 @@ public class PoseEstimator {
         float diag = Math.max(diagA, diagB);
         if (diag < 1e-6f) return iou;
         float distNorm = Math.min(1f, dist / diag);
-        return iou + DIST_WEIGHT * (1f - distNorm);
+        // 方案 A：MeMoSORT Mo-IoU 高度相似性（heightSim）。heightRatio ∈ (0,1]，
+        // 越接近1（高度完全一致）heightSim=1；差异大（高度≥2倍差）heightSim=0。
+        // FPS 场景人物身高相对稳定，重叠时"差不多高"是同一个人的强信号。
+        float hA = boxA[3];
+        float hB = boxB[3];
+        float heightRatio = (hA < hB) ? hA / (hB + 1e-6f) : hB / (hA + 1e-6f);
+        float heightNorm = Math.max(0f, (heightRatio - 0.5f) * 2f); // ratio∈[0.5,1]→0~1线性
+        float heightSim = Math.min(1f, heightNorm);
+        return iou + DIST_WEIGHT * (1f - distNorm) + HEIGHT_SIM_WEIGHT * heightSim;
     }
 
     /**
