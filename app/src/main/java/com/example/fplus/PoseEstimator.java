@@ -7,6 +7,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.os.Process;
 import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
@@ -499,7 +500,15 @@ public class PoseEstimator {
         scaleRect2 = new Rect(0, 0, inputSize, inputSize);
         scaleSrcRect2 = new Rect();
         secondExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "SecondInferThread");
+            Thread t = new Thread(() -> {
+                // Android 线程分类依赖 Process.setThreadPriority（Linux nice），
+                // 仅 Thread.MAX_PRIORITY 只改 VM 层调度顺序，对系统温控/降频无效。
+                // 必须在线程启动后的 run() 内部调用才能生效，且可能被安全策略拒绝 → 吞异常
+                try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+                catch (Throwable ignored) { /* 没权限时退回默认优先级 */ }
+                r.run();
+            }, "SecondInferThread");
+            // 保留 Java 层优先级做兜底
             t.setPriority(Thread.MAX_PRIORITY);
             return t;
         });
@@ -698,8 +707,8 @@ public class PoseEstimator {
         if (!dynBrightComputed) {
             long sumL = 0;
             int sampleCount = 0;
-            int rowStep = 4;  // 每 4 行抽 1 行，每 4 列抽 1 列 = 抽样率 1/16
-            int colStep = 4;
+            int rowStep = 8;  // 每 8 行抽 1 行，每 8 列抽 1 列 = 抽样率 1/64，
+            int colStep = 8;  //   对应 EMA 收敛速度仍远快于画面整体亮度变化，同时比原 1/16 省 3/4 的整数乘加
             int w4 = width * 4;
             for (int y = 0; y < height; y += rowStep) {
                 int rowOff = y * w4;

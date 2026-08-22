@@ -23,6 +23,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.Process;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -58,6 +59,7 @@ public class ScreenCaptureService extends Service {
     private PoseEstimator poseEstimator;
     private OverlayView overlayView;
     private WindowManager windowManager;
+    private PowerManager.WakeLock cpuWakeLock;  // PARTIAL_WAKE_LOCK：保持 CPU 不进入 idle 降压
     private boolean isCapturing = false;
 
     private MediaProjection.Callback projectionCallback;
@@ -147,6 +149,24 @@ public class ScreenCaptureService extends Service {
     private void startCapture() {
         if (mediaProjection == null || isCapturing) return;
 
+        // PARTIAL_WAKE_LOCK：只保持 CPU 运行（屏幕关闭也没用，因为我们要触控/屏显）
+        // 作用：避免系统调度器在用户短暂不触控时进入轻度 idle 并立即降频降压
+        // ON_AFTER_RELEASE：释放时恢复用户手动点亮后的亮度调节逻辑；不计数（不 setCounted）
+        // 安全策略：拿不到时静默失败，不影响核心功能
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null) {
+                cpuWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK
+                        | PowerManager.ON_AFTER_RELEASE, "FPlus:cpu_lock");
+                cpuWakeLock.setReferenceCounted(false);
+                cpuWakeLock.acquire(10 * 60 * 1000L /* 10 min 超时兜底，防止泄漏 */);
+                Log.d(TAG, "PARTIAL_WAKE_LOCK acquired (timeout=10min)");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "WakeLock acquire failed, degrade: " + t.getMessage());
+            cpuWakeLock = null;
+        }
+
         // 获取屏幕实际尺寸（自然方向，不随旋转变）
         DisplayMetrics metrics = new DisplayMetrics();
         windowManager.getDefaultDisplay().getRealMetrics(metrics);
@@ -188,7 +208,9 @@ public class ScreenCaptureService extends Service {
         inferenceThread.start();
         inferenceHandler = new Handler(inferenceThread.getLooper());
 
-        captureThread = new HandlerThread("CaptureThread");
+        // CaptureThread（像素拷贝+Canvas缩放）是 pre/convert 耗时主体，从默认(0)升到 DISPLAY(-4)，
+        // 温控调度器优先降级低优先级线程，提升后能降低被降频概率，同时不抢 URGENT_DISPLAY(-10) 的推理线程
+        captureThread = new HandlerThread("CaptureThread", Process.THREAD_PRIORITY_DISPLAY);
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         imageReader.setOnImageAvailableListener(reader -> {
@@ -496,6 +518,14 @@ public class ScreenCaptureService extends Service {
         }
 
         removeOverlayView();
+
+        // 最后释放 WakeLock（即使没 acquire 成功也安全，null/Held 都会短路）
+        if (cpuWakeLock != null) {
+            try {
+                if (cpuWakeLock.isHeld()) cpuWakeLock.release();
+            } catch (Throwable ignored) { /* 重复 release 或系统已回收 */ }
+            cpuWakeLock = null;
+        }
         instance = null;
     }
 
