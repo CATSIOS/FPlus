@@ -1051,17 +1051,12 @@ public class PoseEstimator {
             if (boxConf < VALID_DETECTION_CONF) continue;
             float cx, cy, w, h;
             if (boxIsXyxy) {
-                // OPT 模型：x1y1x2y2 corner（像素值）→ ÷inputSize 归一化 → cxcywh
-                float x1 = getOutputValue2(0, i);
-                float y1 = getOutputValue2(1, i);
-                float x2 = getOutputValue2(2, i);
-                float y2 = getOutputValue2(3, i);
+                // OPT 模型：box 为 cxcywh 像素值 → ÷inputSize 归一化
                 float invSz = 1f / inputSize;
-                cx = (x1 + x2) * 0.5f * invSz;
-                cy = (y1 + y2) * 0.5f * invSz;
-                w = (x2 - x1) * invSz;
-                h = (y2 - y1) * invSz;
-                if (w <= 0f || h <= 0f) continue;
+                cx = getOutputValue2(0, i) * invSz;
+                cy = getOutputValue2(1, i) * invSz;
+                w = getOutputValue2(2, i) * invSz;
+                h = getOutputValue2(3, i) * invSz;
             } else {
                 cx = getOutputValue2(0, i);
                 cy = getOutputValue2(1, i);
@@ -1263,20 +1258,16 @@ public class PoseEstimator {
 
             float cx, cy, w, h;
             if (boxIsXyxy) {
-                // OPT 模型：前四通道是 x1,y1,x2,y2（**像素值** corner）→ 先÷inputSize 归一化，再转 cxcywh
-                float x1 = getOutputValue(0, i);
-                float y1 = getOutputValue(1, i);
-                float x2 = getOutputValue(2, i);
-                float y2 = getOutputValue(3, i);
+                // OPT 模型：box 同为 cxcywh 格式，但单位是「像素值」(0~inputSize)，
+                // 而非旧模型的归一化 0~1。直接÷inputSize 归一化即可，无需 xyxy 转换。
+                // （实测：OPT 416 的 cxcywh × 1/416 == 非OPT 416 的归一化 cxcywh，精确吻合）
                 float invSz = 1f / inputSize;
-                cx = (x1 + x2) * 0.5f * invSz;
-                cy = (y1 + y2) * 0.5f * invSz;
-                w = (x2 - x1) * invSz;
-                h = (y2 - y1) * invSz;
-                // corner 格式数值非法时跳过（防止 x2<x1 产生负面积）
-                if (w <= 0f || h <= 0f) continue;
+                cx = getOutputValue(0, i) * invSz;
+                cy = getOutputValue(1, i) * invSz;
+                w = getOutputValue(2, i) * invSz;
+                h = getOutputValue(3, i) * invSz;
             } else {
-                // 旧模型：默认 cxcywh 格式（已归一化 0~1）
+                // 旧模型：cxcywh 格式（已归一化 0~1）
                 cx = getOutputValue(0, i);
                 cy = getOutputValue(1, i);
                 w = getOutputValue(2, i);
