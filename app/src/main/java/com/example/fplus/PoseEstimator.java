@@ -8,6 +8,7 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.os.Process;
+import android.text.TextUtils;
 import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
@@ -98,6 +99,19 @@ public class PoseEstimator {
     private Rect scaleRect;
     private Rect scaleSrcRect;
     private float[][][] output;
+
+    // 多输出支持（ultralytics onnxsim+onnx2tf 新版把 box/score 分成两个 output tensor）：
+    //   multiOutputMode=true : outputBoxes = [1,4,N or N,4]（x1y1x2y2 或 cxcywh）
+    //                          outputScores = [1,nc,N or N,nc]（类置信度）
+    //                          numChannels = 4 + nc（逻辑上合成单输出的通道数）
+    //                          调用 interpreter.run 时用 Map<Integer, Object> outputs
+    //   multiOutputMode=false: 旧单 output 模式，output = [1,4+nc,N]
+    private boolean multiOutputMode = false;
+    private float[][][] outputBoxes;
+    private float[][][] outputScores;
+    private int numScoreClasses = 0;  // multiOutput 模式下 score 的通道数
+    private boolean firstInferLogged = false;  // 第1帧推理后打 WARN 日志，查真实数值
+    private boolean realStatsLogged = false;   // 真实画面首帧 conf/box 范围统计（仅OPT模型诊断用，1次）
 
     // ===== PoC: 双实例并发推理（榨 GPU 并行算力）=====
     // 目的：验证 TFLite 双 GpuDelegate 实例能否真并发，榨干 GPU 空闲算力且端到端不卡。
@@ -263,7 +277,7 @@ public class PoseEstimator {
         // 的 Detect 模块已做 box decode，输出前四通道是 x1y1x2y2 corner；
         // 旧模型未经 decode，输出是 cxcywh。按文件名直接区分，100% 可靠。
         boxIsXyxy = modelName != null && modelName.contains("_opt");
-        Log.d(TAG, "model=" + modelName + " → boxIsXyxy=" + boxIsXyxy);
+        Log.w(TAG, "[INIT] model=" + modelName + " boxIsXyxy=" + boxIsXyxy);
 
         loadPrefs(context);
         MappedByteBuffer modelBuffer = loadModelFile(context, modelName);
@@ -286,57 +300,131 @@ public class PoseEstimator {
         if (interpreter == null) {
             throw (lastError != null) ? lastError : new IOException("所有推理后端初始化失败");
         }
+        Log.w(TAG, "[INIT] ckpt1 interpreter NON-NULL, backend=" + this.backend);
 
-        int[] inputShape = interpreter.getInputTensor(0).shape();
-        if (inputShape.length == 4 && inputShape[3] == 3) {
-            inputNchw = false;  // NHWC [1,H,W,3]
-        } else {
-            inputNchw = true;   // NCHW [1,3,H,W]
-        }
-        // 从模型 shape 读取实际输入尺寸（支持 640 / 416 等）
-        if (inputShape.length == 4) {
-            inputSize = inputNchw ? inputShape[2] : inputShape[1];
-        }
-        org.tensorflow.lite.Tensor inputTensor = interpreter.getInputTensor(0);
-        org.tensorflow.lite.Tensor.QuantizationParams inQ = inputTensor.quantizationParams();
-        Log.d(TAG, "input dtype=" + inputTensor.dataType()
-                + ", shape: " + Arrays.toString(inputShape)
-                + ", quant scale=" + inQ.getScale() + " zeroPoint=" + inQ.getZeroPoint());
+        try {
+            int[] inputShape = interpreter.getInputTensor(0).shape();
+            Log.w(TAG, "[INIT] ckpt2 inputShape=" + Arrays.toString(inputShape));
+            if (inputShape.length == 4 && inputShape[3] == 3) {
+                inputNchw = false;  // NHWC [1,H,W,3]
+            } else {
+                inputNchw = true;   // NCHW [1,3,H,W]
+            }
+            // 从模型 shape 读取实际输入尺寸（支持 640 / 416 等）
+            if (inputShape.length == 4) {
+                inputSize = inputNchw ? inputShape[2] : inputShape[1];
+            }
+            org.tensorflow.lite.Tensor inputTensor = interpreter.getInputTensor(0);
+            org.tensorflow.lite.Tensor.QuantizationParams inQ = inputTensor.quantizationParams();
+            Log.w(TAG, "[INIT] ckpt3 input dtype=" + inputTensor.dataType()
+                    + ", shape: " + Arrays.toString(inputShape)
+                    + ", quant scale=" + inQ.getScale() + " zeroPoint=" + inQ.getZeroPoint());
 
-        int[] outputShape = interpreter.getOutputTensor(0).shape();
-        org.tensorflow.lite.Tensor outputTensor = interpreter.getOutputTensor(0);
-        org.tensorflow.lite.Tensor.QuantizationParams outQ = outputTensor.quantizationParams();
-        Log.d(TAG, "Output shape: " + Arrays.toString(outputShape)
-                + ", dtype=" + outputTensor.dataType()
-                + ", quant scale=" + outQ.getScale() + " zeroPoint=" + outQ.getZeroPoint());
-        if (outputShape.length != 3) {
-            interpreter.close();
-            throw new IOException("Unexpected output shape: " + Arrays.toString(outputShape));
-        }
+            int outputCount = interpreter.getOutputTensorCount();
+            Log.w(TAG, "[INIT] outputTensorCount=" + outputCount);
+            for (int oi = 0; oi < outputCount; oi++) {
+                int[] outShape = interpreter.getOutputTensor(oi).shape();
+                org.tensorflow.lite.Tensor outT = interpreter.getOutputTensor(oi);
+                org.tensorflow.lite.Tensor.QuantizationParams outQ2 = outT.quantizationParams();
+                Log.w(TAG, "[INIT] output[" + oi + "] shape=" + Arrays.toString(outShape)
+                        + " dtype=" + outT.dataType()
+                        + " quant scale=" + outQ2.getScale() + " zp=" + outQ2.getZeroPoint());
+            }
+            int[] outputShape = interpreter.getOutputTensor(0).shape();
+            org.tensorflow.lite.Tensor outputTensor = interpreter.getOutputTensor(0);
+            org.tensorflow.lite.Tensor.QuantizationParams outQ3 = outputTensor.quantizationParams();
+            Log.w(TAG, "[INIT] Output[0] shape: " + Arrays.toString(outputShape)
+                    + ", dtype=" + outputTensor.dataType()
+                    + ", quant scale=" + outQ3.getScale() + " zeroPoint=" + outQ3.getZeroPoint());
 
-        // 判断维度顺序：通道维（如 6）通常远小于 anchor 维（如 2100）
-        int dim1 = outputShape[1];
-        int dim2 = outputShape[2];
-        if (dim1 < dim2) {
-            channelFirst = true;
-            numChannels = dim1;
-            numAnchors = dim2;
-        } else {
-            channelFirst = false;
-            numChannels = dim2;
-            numAnchors = dim1;
-        }
-        Log.d(TAG, "channelFirst=" + channelFirst + ", channels=" + numChannels + ", anchors=" + numAnchors);
+            // ---------- 多输出判定：新版 ultralytics 导出通常 outputCount=2（boxes 分离，scores 分离） ----------
+            //   output[0] 通常是 [1,4,N] 或 [1,N,4]（boxes），output[1] 通常是 [1,nc,N] 或 [1,N,nc]（scores）
+            //   我们把这个模式抽出来合成单输出语义，保证 parseOutput 旧逻辑最小改动。
+            if (outputCount >= 2 && outputShape.length == 3) {
+                int[] shapeOut0 = interpreter.getOutputTensor(0).shape();
+                int[] shapeOut1 = interpreter.getOutputTensor(1).shape();
+                boolean ok0 = shapeOut0.length == 3;
+                boolean ok1 = shapeOut1.length == 3;
+                int d1_0 = (ok0 && shapeOut0[1] < shapeOut0[2]) ? shapeOut0[1] : (ok0 ? shapeOut0[2] : -1);
+                int n_0 = (ok0 && shapeOut0[1] < shapeOut0[2]) ? shapeOut0[2] : (ok0 ? shapeOut0[1] : -1);
+                int d1_1 = (ok1 && shapeOut1[1] < shapeOut1[2]) ? shapeOut1[1] : (ok1 ? shapeOut1[2] : -1);
+                int n_1 = (ok1 && shapeOut1[1] < shapeOut1[2]) ? shapeOut1[2] : (ok1 ? shapeOut1[1] : -1);
+                // 典型：output[0]通道数=4（boxes），output[1]通道数=nc>4（scores），anchor数N一致
+                if (ok0 && ok1 && d1_0 == 4 && d1_1 > 4 && n_0 == n_1) {
+                    multiOutputMode = true;
+                    channelFirst = (shapeOut0[1] < shapeOut0[2]);  // boxes 的维度顺序就是全局顺序
+                    numAnchors = n_0;
+                    numScoreClasses = d1_1;
+                    numChannels = 4 + numScoreClasses;  // 逻辑合成：前4是box，后nc是score
+                    Log.w(TAG, "[INIT] DETECTED multi-output (boxes+scores separated) mode! "
+                            + "boxes_ch=4 scores_ch=" + numScoreClasses + " anchors=" + numAnchors
+                            + " channelFirst=" + channelFirst);
+                }
+            }
+            // 单输出模式下要检查 shape
+            if (!multiOutputMode && outputShape.length != 3) {
+                interpreter.close();
+                throw new IOException("Unexpected output[0] shape (single output mode): " + Arrays.toString(outputShape));
+            }
 
-        output = new float[outputShape[0]][outputShape[1]][outputShape[2]];
-        inputBuffer = ByteBuffer.allocateDirect(1 * 3 * inputSize * inputSize * 4);
-        inputBuffer.order(ByteOrder.nativeOrder());
-        inputBuffer.rewind();
-        inputFloatBuffer = inputBuffer.asFloatBuffer();
+            // 判断维度顺序（如果已经是 multiOutput，上面已经算好了，就跳过）
+            if (!multiOutputMode) {
+                int dim1 = outputShape[1];
+                int dim2 = outputShape[2];
+                if (dim1 < dim2) {
+                    channelFirst = true;
+                    numChannels = dim1;
+                    numAnchors = dim2;
+                } else {
+                    channelFirst = false;
+                    numChannels = dim2;
+                    numAnchors = dim1;
+                }
+            }
+            Log.w(TAG, "[INIT] FINAL channelFirst=" + channelFirst + ", channels=" + numChannels + ", anchors=" + numAnchors
+                    + " multiOutput=" + multiOutputMode);
 
-        // ===== 双实例并发 PoC：仅开关开启时建第二套资源，关闭时零开销 =====
-        if (DUAL_INFER_ENABLED) {
-            initSecondInstance(modelBuffer);
+            if (multiOutputMode) {
+                int[] s0 = interpreter.getOutputTensor(0).shape();
+                int[] s1 = interpreter.getOutputTensor(1).shape();
+                outputBoxes = new float[s0[0]][s0[1]][s0[2]];
+                outputScores = new float[s1[0]][s1[1]][s1[2]];
+            } else {
+                output = new float[outputShape[0]][outputShape[1]][outputShape[2]];
+            }
+            Log.w(TAG, "[INIT] ckpt4 output array allocated OK");
+            inputBuffer = ByteBuffer.allocateDirect(1 * 3 * inputSize * inputSize * 4);
+            inputBuffer.order(ByteOrder.nativeOrder());
+            inputBuffer.rewind();
+            inputFloatBuffer = inputBuffer.asFloatBuffer();
+            Log.w(TAG, "[INIT] ckpt5 inputBuffer allocated OK");
+
+            // ===== 双实例并发 PoC：仅开关开启时建第二套资源，关闭时零开销 =====
+            if (DUAL_INFER_ENABLED) {
+                initSecondInstance(modelBuffer);
+            }
+            Log.w(TAG, "[INIT] ckpt6 SECOND_INSTANCE init done (or skipped)");
+
+            // ---------- 调试：构造完成后强制跑一张全黑图，确保 FIRST_INFER 日志必出 ----------
+            //   （用于反推 _opt 模型的 box 编码/归一化/conf 通道，不需要任何权限/投屏）
+            try {
+                int probeW = 640, probeH = 640;
+                int[] px = new int[probeW * probeH]; // 默认为 0=ARGB全黑
+                Bitmap black = Bitmap.createBitmap(probeW, probeH, Bitmap.Config.ARGB_8888);
+                black.setPixels(px, 0, probeW, 0, 0, probeW, probeH);
+                Log.w(TAG, "[INIT] ckpt7 probe estimate start (black 640x640)...");
+                estimate(black);
+                black.recycle();
+                Log.w(TAG, "[INIT] ckpt8 probe estimate OK");
+            } catch (Throwable t) {
+                Log.e(TAG, "[INIT_PROBE_EXCEPTION] probe failed", t);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "[INIT_FATAL] exception during tensor shape/array init", t);
+            try { if (interpreter != null) interpreter.close(); } catch (Throwable ignored) {}
+            closeHardwareDelegate();
+            interpreter = null;
+            throw new IOException("Shape/output init failed", t);
         }
     }
 
@@ -557,7 +645,78 @@ public class PoseEstimator {
             f2 = secondExecutor.submit(() -> runSecondInference(bitmap));
         }
 
-        interpreter.run(inputBuffer, output);
+        if (multiOutputMode) {
+            java.util.Map<Integer, Object> outputs = new java.util.HashMap<>();
+            outputs.put(0, outputBoxes);
+            outputs.put(1, outputScores);
+            interpreter.runForMultipleInputsOutputs(new Object[]{inputBuffer}, outputs);
+        } else {
+            interpreter.run(inputBuffer, output);
+        }
+        // ---------- 第一帧：WARN 级打前10个anchor的原始box/conf数值，便于定位编码错 ----------
+        if (!firstInferLogged) {
+            firstInferLogged = true;
+            StringBuilder sb = new StringBuilder(1200);
+            sb.append("[FIRST_INFER] top10 anchors raw output (multiOutput=").append(multiOutputMode)
+                    .append(" boxIsXyxy=").append(boxIsXyxy).append(" chFirst=").append(channelFirst)
+                    .append(" numChannels=").append(numChannels).append(" inputSize=").append(inputSize)
+                    .append("):\n");
+            int showCount = Math.min(10, numAnchors);
+            for (int i = 0; i < showCount; i++) {
+                float v0 = getOutputValue(0, i);
+                float v1 = getOutputValue(1, i);
+                float v2 = getOutputValue(2, i);
+                float v3 = getOutputValue(3, i);
+                // 把后面所有通道的值都打出来（nc<=5的话很紧凑），看清楚 conf 到底在第几通道
+                java.util.List<String> extras = new java.util.ArrayList<>();
+                float maxConf = 0f;
+                int maxC = -1;
+                for (int c = 4; c < numChannels; c++) {
+                    float cf = getOutputValue(c, i);
+                    extras.add("c" + c + "=" + fmt4(cf));
+                    if (cf > maxConf) { maxConf = cf; maxC = c; }
+                }
+                sb.append("  anchor#").append(i).append(": [0]=").append(fmt4(v0)).append(" [1]=").append(fmt4(v1))
+                        .append(" [2]=").append(fmt4(v2)).append(" [3]=").append(fmt4(v3))
+                        .append("  ").append(TextUtils.join(" ", extras))
+                        .append("  maxConf=").append(fmt4(maxConf)).append("(ch=").append(maxC).append(")\n");
+            }
+            // ---------- 启发式自检：如果 c4..end 全 < 0 或 maxConf < 0.01 并且 [0]~[3] 明显是像素值
+            //            → 证明 channelFirst 判反了！真实 shape[1,6,2100] 其实是 [1,N,F] 被我按 [1,F,N] 读了
+            //            → 临时翻转读一次，对比 conf 数值范围
+            if (numChannels >= 5) {
+                float chRangeMax = -Float.MAX_VALUE;
+                float chRangeMin = Float.MAX_VALUE;
+                for (int c = 4; c < numChannels; c++) {
+                    for (int i = 0; i < Math.min(100, numAnchors); i++) {
+                        float v = getOutputValue(c, i);
+                        if (v > chRangeMax) chRangeMax = v;
+                        if (v < chRangeMin) chRangeMin = v;
+                    }
+                }
+                sb.append("  [CHECK ch4..end] min=").append(fmt4(chRangeMin)).append(" max=").append(fmt4(chRangeMax))
+                        .append("  (合理范围应为 0~1，sigmoid置信度)\n");
+                // 额外打每个 conf 通道前 10 个 anchor 的实际数值，不做翻转读（数组维度不匹配）
+                try {
+                    java.util.List<String> perCh = new java.util.ArrayList<>();
+                    int dispN = Math.min(10, numAnchors);
+                    for (int c = 4; c < numChannels; c++) {
+                        StringBuilder cb = new StringBuilder();
+                        cb.append("ch").append(c).append("=[");
+                        for (int i = 0; i < dispN; i++) {
+                            if (i > 0) cb.append(",");
+                            cb.append(fmt4(getOutputValue(c, i)));
+                        }
+                        cb.append("]");
+                        perCh.add(cb.toString());
+                    }
+                    sb.append("  [CONF channels] ").append(TextUtils.join(" ", perCh)).append("\n");
+                } catch (Throwable t) {
+                    sb.append("  [CONF channels] SKIPPED ex=").append(t.getClass().getSimpleName()).append("\n");
+                }
+            }
+            Log.w(TAG, sb.toString());
+        }
         long t3 = System.nanoTime();
         PersonPose pose = parseOutput();
         long t4 = System.nanoTime();
@@ -881,23 +1040,38 @@ public class PoseEstimator {
         PersonPose best = null;
         float maxScore = -1f;
         for (int i = 0; i < numPredictions; i++) {
-            float boxConf = 0;
-            for (int c = 4; c < numChannels; c++) {
-                float conf = getOutputValue2(c, i);
-                if (conf > boxConf) boxConf = conf;
+            float boxConf;
+            if (boxIsXyxy) {
+                // OPT 模型 (YOLOv8 Detect folded): raw logits → Java 端手动 sigmoid → boxConf = σ(obj) * σ(max_cls)
+                float objRaw = getOutputValue2(4, i);
+                float clsRaw = 0f;
+                for (int c = 5; c < numChannels; c++) {
+                    float cf = getOutputValue2(c, i);
+                    if (cf > clsRaw) clsRaw = cf;
+                }
+                float objConf = 1f / (1f + (float) Math.exp(-objRaw));
+                float clsConf = 1f / (1f + (float) Math.exp(-clsRaw));
+                boxConf = objConf * clsConf;
+            } else {
+                boxConf = 0;
+                for (int c = 4; c < numChannels; c++) {
+                    float conf = getOutputValue2(c, i);
+                    if (conf > boxConf) boxConf = conf;
+                }
             }
             if (boxConf < VALID_DETECTION_CONF) continue;
             float cx, cy, w, h;
             if (boxIsXyxy) {
-                // OPT 模型：x1y1x2y2 corner → cxcywh
+                // OPT 模型：x1y1x2y2 corner（像素值）→ ÷inputSize 归一化 → cxcywh
                 float x1 = getOutputValue2(0, i);
                 float y1 = getOutputValue2(1, i);
                 float x2 = getOutputValue2(2, i);
                 float y2 = getOutputValue2(3, i);
-                cx = (x1 + x2) * 0.5f;
-                cy = (y1 + y2) * 0.5f;
-                w = x2 - x1;
-                h = y2 - y1;
+                float invSz = 1f / inputSize;
+                cx = (x1 + x2) * 0.5f * invSz;
+                cy = (y1 + y2) * 0.5f * invSz;
+                w = (x2 - x1) * invSz;
+                h = (y2 - y1) * invSz;
                 if (w <= 0f || h <= 0f) continue;
             } else {
                 cx = getOutputValue2(0, i);
@@ -953,6 +1127,16 @@ public class PoseEstimator {
     }
 
     private float getOutputValue(int channel, int anchor) {
+        if (multiOutputMode) {
+            if (channel < 4) {
+                if (channelFirst) return outputBoxes[0][channel][anchor];
+                else return outputBoxes[0][anchor][channel];
+            } else {
+                int sc = channel - 4;
+                if (channelFirst) return outputScores[0][sc][anchor];
+                else return outputScores[0][anchor][sc];
+            }
+        }
         if (channelFirst) {
             return output[0][channel][anchor];
         } else {
@@ -960,8 +1144,62 @@ public class PoseEstimator {
         }
     }
 
+    /** 日志格式化：保留4位小数，避免科学计数法淹没关键信息 */
+    private static String fmt4(float v) {
+        if (Float.isNaN(v) || Float.isInfinite(v)) return Float.toString(v);
+        return String.format(java.util.Locale.US, "%.4f", v);
+    }
+
     private PersonPose parseOutput() {
         int numPredictions = numAnchors;
+
+        // ========== OPT模型真实首帧诊断：统计obj/cls通道raw范围 + 是否需sigmoid ==========
+        // probe是黑图(firstInferLogged=true表示probe已跑完)，接下来第一次真实画面调用才统计，只跑1次
+        if (boxIsXyxy && firstInferLogged && !realStatsLogged) {
+            realStatsLogged = true;
+            float objMin = Float.MAX_VALUE, objMax = -Float.MAX_VALUE;
+            float clsMin = Float.MAX_VALUE, clsMax = -Float.MAX_VALUE;
+            float rawProdMax = 0f, sigProdMax = 0f;
+            int rawPassCnt = 0, sigPassCnt = 0;
+            java.util.List<String> top5 = new java.util.ArrayList<>();
+            int showN = Math.min(5, numPredictions);
+            for (int i = 0; i < numPredictions; i++) {
+                float obj = getOutputValue(4, i);
+                float cls = 0f;
+                for (int c = 5; c < numChannels; c++) {
+                    float cf = getOutputValue(c, i);
+                    if (cf > cls) cls = cf;
+                }
+                if (obj < objMin) objMin = obj;  if (obj > objMax) objMax = obj;
+                if (cls < clsMin) clsMin = cls;  if (cls > clsMax) clsMax = cls;
+                float rp = obj * cls;
+                float sigO = 1f / (1f + (float) Math.exp(-obj));
+                float sigC = 1f / (1f + (float) Math.exp(-cls));
+                float sp = sigO * sigC;
+                if (rp > rawProdMax) rawProdMax = rp;
+                if (sp > sigProdMax) sigProdMax = sp;
+                if (rp >= BYTETRACK_LOW_CONF) rawPassCnt++;
+                if (sp >= BYTETRACK_LOW_CONF) sigPassCnt++;
+                if (i < showN) {
+                    top5.add(String.format(java.util.Locale.US,
+                            "#%d obj=%s cls=%s rp=%s sp=%s (sigO=%s sigC=%s)",
+                            i, fmt4(obj), fmt4(cls), fmt4(rp), fmt4(sp), fmt4(sigO), fmt4(sigC)));
+                }
+            }
+            StringBuilder sb = new StringBuilder(800);
+            sb.append("[REAL_STATS_OPT] first real frame stats, anchors=").append(numPredictions)
+                    .append(" BYTETRACK_LOW_CONF=").append(BYTETRACK_LOW_CONF).append('\n');
+            sb.append("  obj(raw) : min=").append(fmt4(objMin)).append(" max=").append(fmt4(objMax))
+                    .append("  (超出0~1 => 缺少sigmoid)\n");
+            sb.append("  cls(raw) : min=").append(fmt4(clsMin)).append(" max=").append(fmt4(clsMax))
+                    .append("  (超出0~1 => 缺少sigmoid)\n");
+            sb.append("  raw(obj*cls) max=").append(fmt4(rawProdMax))
+                    .append("  pass>=").append(BYTETRACK_LOW_CONF).append(" count=").append(rawPassCnt).append('\n');
+            sb.append("  sig(obj)*sig(cls) max=").append(fmt4(sigProdMax))
+                    .append("  pass>=").append(BYTETRACK_LOW_CONF).append(" count=").append(sigPassCnt).append('\n');
+            sb.append("  top5 anchors: ").append(TextUtils.join(" | ", top5));
+            Log.w(TAG, sb.toString());
+        }
 
         // 收集 low conf 检测的 box（[px,py,pw,ph,conf]）用于 ByteTrack 第二阶段
         float[][] lowBoxes = null;
@@ -1021,11 +1259,26 @@ public class PoseEstimator {
         boolean bestMatchedTrack = false;
 
         for (int i = 0; i < numPredictions; i++) {
-            float boxConf = 0;
-            for (int c = 4; c < numChannels; c++) {
-                float conf = getOutputValue(c, i);
-                if (conf > boxConf) {
-                    boxConf = conf;
+            float boxConf;
+            if (boxIsXyxy) {
+                // OPT 模型 (YOLOv8 Detect folded): raw logits → Java 端手动 sigmoid → boxConf = σ(obj) * σ(max_cls)
+                float objRaw = getOutputValue(4, i);
+                float clsRaw = 0f;
+                for (int c = 5; c < numChannels; c++) {
+                    float cf = getOutputValue(c, i);
+                    if (cf > clsRaw) clsRaw = cf;
+                }
+                // onnx2tf 导出 box decode 折叠时把 sigmoid 留在了图外（logit 直通输出），Java 端手动补
+                float objConf = 1f / (1f + (float) Math.exp(-objRaw));
+                float clsConf = 1f / (1f + (float) Math.exp(-clsRaw));
+                boxConf = objConf * clsConf;
+            } else {
+                boxConf = 0;
+                for (int c = 4; c < numChannels; c++) {
+                    float conf = getOutputValue(c, i);
+                    if (conf > boxConf) {
+                        boxConf = conf;
+                    }
                 }
             }
             // ByteTrack: 第一阶段阈值用 HIGH；低于 HIGH 但 >= LOW 暂存为候选项
@@ -1035,19 +1288,20 @@ public class PoseEstimator {
 
             float cx, cy, w, h;
             if (boxIsXyxy) {
-                // OPT 模型：前四通道是 x1,y1,x2,y2（归一化 corner）→ 转成 cxcywh
+                // OPT 模型：前四通道是 x1,y1,x2,y2（**像素值** corner）→ 先÷inputSize 归一化，再转 cxcywh
                 float x1 = getOutputValue(0, i);
                 float y1 = getOutputValue(1, i);
                 float x2 = getOutputValue(2, i);
                 float y2 = getOutputValue(3, i);
-                cx = (x1 + x2) * 0.5f;
-                cy = (y1 + y2) * 0.5f;
-                w = x2 - x1;
-                h = y2 - y1;
+                float invSz = 1f / inputSize;
+                cx = (x1 + x2) * 0.5f * invSz;
+                cy = (y1 + y2) * 0.5f * invSz;
+                w = (x2 - x1) * invSz;
+                h = (y2 - y1) * invSz;
                 // corner 格式数值非法时跳过（防止 x2<x1 产生负面积）
                 if (w <= 0f || h <= 0f) continue;
             } else {
-                // 旧模型：默认 cxcywh 格式
+                // 旧模型：默认 cxcywh 格式（已归一化 0~1）
                 cx = getOutputValue(0, i);
                 cy = getOutputValue(1, i);
                 w = getOutputValue(2, i);
