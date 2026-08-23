@@ -76,6 +76,18 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/model_416" />
+
+                <RadioButton
+                    android:id="@+id/radio_model_320_opt"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/model_320_opt" />
+
+                <RadioButton
+                    android:id="@+id/radio_model_416_opt"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/model_416_opt" />
             </RadioGroup>
 
             <TextView

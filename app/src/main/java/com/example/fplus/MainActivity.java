@@ -29,6 +29,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String MODEL_NHWC = "sunxds_0.8.0_float32.tflite";
     private static final String MODEL_INT8 = "sunxds_0.8.0_w8a16.tflite";
     private static final String MODEL_416 = "sunxds_0.8.0_416.tflite";
+    private static final String MODEL_320_OPT = "sunxds_0.8.0_320_opt.tflite";
+    private static final String MODEL_416_OPT = "sunxds_0.8.0_416_opt.tflite";
 
     private SharedPreferences prefs;
     private RadioGroup radioModel;
@@ -180,8 +182,8 @@ public class MainActivity extends AppCompatActivity {
             Bitmap testBitmap = Bitmap.createBitmap(720, 450, Bitmap.Config.ARGB_8888);
             testBitmap.eraseColor(0xFF808080);
 
-            // 测 640 与 416 两个尺寸（NHWC/w8a16 实测更慢，已证伪，不再参与测速）
-            String[] models = {MODEL_DEFAULT, MODEL_416};
+            // 测 640/416/320opt/416opt（NHWC/INT8 实测更慢，已证伪，不再参与测速）
+            String[] models = {MODEL_DEFAULT, MODEL_416, MODEL_320_OPT, MODEL_416_OPT};
             // 测速只测 NPU / GPU，CPU 永远最慢，跳过以大幅缩短测速时间
             PoseEstimator.Backend[] backends = {
                     PoseEstimator.Backend.NNAPI,
@@ -275,6 +277,8 @@ public class MainActivity extends AppCompatActivity {
         if (MODEL_NHWC.equals(model)) return "640/NHWC";
         if (MODEL_INT8.equals(model)) return "640/INT8";
         if (MODEL_416.equals(model)) return "416";
+        if (MODEL_320_OPT.equals(model)) return "320/OPT(原生训练)";
+        if (MODEL_416_OPT.equals(model)) return "416/OPT(简化)";
         return "640/NCHW";
     }
 
@@ -309,6 +313,8 @@ public class MainActivity extends AppCompatActivity {
         if (MODEL_NHWC.equals(model)) return R.id.radio_model_nhwc;
         if (MODEL_INT8.equals(model)) return R.id.radio_model_int8;
         if (MODEL_416.equals(model)) return R.id.radio_model_416;
+        if (MODEL_320_OPT.equals(model)) return R.id.radio_model_320_opt;
+        if (MODEL_416_OPT.equals(model)) return R.id.radio_model_416_opt;
         return R.id.radio_model_default;
     }
 
@@ -316,6 +322,8 @@ public class MainActivity extends AppCompatActivity {
         if (checkedId == R.id.radio_model_nhwc) return MODEL_NHWC;
         if (checkedId == R.id.radio_model_int8) return MODEL_INT8;
         if (checkedId == R.id.radio_model_416) return MODEL_416;
+        if (checkedId == R.id.radio_model_320_opt) return MODEL_320_OPT;
+        if (checkedId == R.id.radio_model_416_opt) return MODEL_416_OPT;
         return MODEL_DEFAULT;
     }
 
