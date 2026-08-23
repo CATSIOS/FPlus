@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RadioGroup xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/radio_backend"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="8dp"
+    android:paddingTop="4dp"
+    android:paddingBottom="8dp">
+
+    <RadioButton
+        android:id="@+id/radio_npu"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/backend_npu" />
+
+    <RadioButton
+        android:id="@+id/radio_gpu"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/backend_gpu" />
+
+    <RadioButton
+        android:id="@+id/radio_cpu"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/backend_cpu" />
+</RadioGroup>

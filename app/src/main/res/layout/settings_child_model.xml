@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RadioGroup xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/radio_model"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="8dp"
+    android:paddingTop="4dp"
+    android:paddingBottom="8dp">
+
+    <RadioButton
+        android:id="@+id/radio_model_default"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/model_default" />
+
+    <RadioButton
+        android:id="@+id/radio_model_nhwc"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/model_nhwc" />
+
+    <RadioButton
+        android:id="@+id/radio_model_int8"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/model_int8" />
+
+    <RadioButton
+        android:id="@+id/radio_model_416"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/model_416" />
+
+    <RadioButton
+        android:id="@+id/radio_model_320_opt"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/model_320_opt" />
+
+    <RadioButton
+        android:id="@+id/radio_model_416_opt"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/model_416_opt" />
+</RadioGroup>

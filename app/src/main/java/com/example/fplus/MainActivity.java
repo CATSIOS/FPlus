@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.util.Log;
 import android.widget.Button;
+import android.widget.ExpandableListView;
 import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -43,13 +44,25 @@ public class MainActivity extends AppCompatActivity {
 
         prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
 
-        radioModel = findViewById(R.id.radio_model);
+        // 左侧：原生可折叠设置（Android Settings 风格 ExpandableListView）
+        String[] groups = {getString(R.string.model_option_title),
+                           getString(R.string.gpu_option_title)};
+        SettingsExpandableAdapter settingsAdapter = new SettingsExpandableAdapter(this, groups);
+        ExpandableListView expandable = findViewById(R.id.expandable_settings);
+        expandable.setAdapter(settingsAdapter);
+        expandable.expandGroup(0);
+        expandable.expandGroup(1);
+        // 防止折叠时父拦截点击影响 groupIndicator，保留原生折叠动画
+        expandable.setOnGroupClickListener((parent, v, groupPosition, id) -> false);
+
+        // Adapter 构造时已预加载 child view，直接取引用（不会 NPE）
+        radioModel = settingsAdapter.getModelRadioGroup();
         String savedModel = prefs.getString("model_name", MODEL_DEFAULT);
         radioModel.check(checkedIdForModel(savedModel));
         radioModel.setOnCheckedChangeListener((group, checkedId) ->
                 prefs.edit().putString("model_name", modelForCheckedId(checkedId)).apply());
 
-        radioBackend = findViewById(R.id.radio_backend);
+        radioBackend = settingsAdapter.getBackendRadioGroup();
 
         String savedBackend = prefs.getString("backend", PoseEstimator.Backend.GPU.name());
         PoseEstimator.Backend backend;
