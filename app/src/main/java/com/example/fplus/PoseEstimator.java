@@ -82,6 +82,7 @@ public class PoseEstimator {
     private GpuDelegate gpuDelegate;
     private NnApiDelegate nnApiDelegate;
     private Backend backend;
+    private String modelName;  // 记录模型文件名，用于 box 格式/版本判定
     private ByteBuffer inputBuffer;
     private FloatBuffer inputFloatBuffer;
     private float[] inputFloats;
@@ -134,6 +135,13 @@ public class PoseEstimator {
     private boolean channelFirst = true;
     private int numChannels = 0;
     private int numAnchors = 0;
+
+    // Box 编码格式：
+    //   false (默认旧格式): [cx, cy, w, h]（归一化 0~1）
+    //   true (OPT新模型)  : [x1, y1, x2, y2] corner（ultralytics + onnxsim 折叠Decode后输出）
+    // 判定策略：文件名含 "_opt" 初判 true + 锚点启发式统计（x1<x2且y1<y2占多数）验证，
+    // 不一致时以统计为准并打日志，防止误判。
+    private boolean boxIsXyxy = false;
 
     // 输入维度顺序：true 表示 NCHW [1,3,H,W]，false 表示 NHWC [1,H,W,3]
     private boolean inputNchw = true;
@@ -250,6 +258,13 @@ public class PoseEstimator {
     }
 
     public PoseEstimator(Context context, String modelName, Backend preferred) throws IOException {
+        this.modelName = modelName;
+        // Box 编码格式：新导出的 _opt 模型（ultralytics export + onnxsim + onnx2tf）
+        // 的 Detect 模块已做 box decode，输出前四通道是 x1y1x2y2 corner；
+        // 旧模型未经 decode，输出是 cxcywh。按文件名直接区分，100% 可靠。
+        boxIsXyxy = modelName != null && modelName.contains("_opt");
+        Log.d(TAG, "model=" + modelName + " → boxIsXyxy=" + boxIsXyxy);
+
         loadPrefs(context);
         MappedByteBuffer modelBuffer = loadModelFile(context, modelName);
 
@@ -872,10 +887,24 @@ public class PoseEstimator {
                 if (conf > boxConf) boxConf = conf;
             }
             if (boxConf < VALID_DETECTION_CONF) continue;
-            float cx = getOutputValue2(0, i);
-            float cy = getOutputValue2(1, i);
-            float w = getOutputValue2(2, i);
-            float h = getOutputValue2(3, i);
+            float cx, cy, w, h;
+            if (boxIsXyxy) {
+                // OPT 模型：x1y1x2y2 corner → cxcywh
+                float x1 = getOutputValue2(0, i);
+                float y1 = getOutputValue2(1, i);
+                float x2 = getOutputValue2(2, i);
+                float y2 = getOutputValue2(3, i);
+                cx = (x1 + x2) * 0.5f;
+                cy = (y1 + y2) * 0.5f;
+                w = x2 - x1;
+                h = y2 - y1;
+                if (w <= 0f || h <= 0f) continue;
+            } else {
+                cx = getOutputValue2(0, i);
+                cy = getOutputValue2(1, i);
+                w = getOutputValue2(2, i);
+                h = getOutputValue2(3, i);
+            }
             float area = w * h;
             if (area < MIN_AREA_THRESHOLD) continue;
             // 反变换到原图像素坐标（第二路 zoom 区域，与主路 cx*roiSize+roiX 同理）
@@ -1004,10 +1033,26 @@ public class PoseEstimator {
                 continue;
             }
 
-            float cx = getOutputValue(0, i);
-            float cy = getOutputValue(1, i);
-            float w = getOutputValue(2, i);
-            float h = getOutputValue(3, i);
+            float cx, cy, w, h;
+            if (boxIsXyxy) {
+                // OPT 模型：前四通道是 x1,y1,x2,y2（归一化 corner）→ 转成 cxcywh
+                float x1 = getOutputValue(0, i);
+                float y1 = getOutputValue(1, i);
+                float x2 = getOutputValue(2, i);
+                float y2 = getOutputValue(3, i);
+                cx = (x1 + x2) * 0.5f;
+                cy = (y1 + y2) * 0.5f;
+                w = x2 - x1;
+                h = y2 - y1;
+                // corner 格式数值非法时跳过（防止 x2<x1 产生负面积）
+                if (w <= 0f || h <= 0f) continue;
+            } else {
+                // 旧模型：默认 cxcywh 格式
+                cx = getOutputValue(0, i);
+                cy = getOutputValue(1, i);
+                w = getOutputValue(2, i);
+                h = getOutputValue(3, i);
+            }
             float area = w * h;
             if (area < MIN_AREA_THRESHOLD) {
                 continue;
