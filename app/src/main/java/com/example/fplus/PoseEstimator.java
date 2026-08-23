@@ -112,6 +112,7 @@ public class PoseEstimator {
     private int numScoreClasses = 0;  // multiOutput 模式下 score 的通道数
     private boolean firstInferLogged = false;  // 第1帧推理后打 WARN 日志，查真实数值
     private boolean realStatsLogged = false;   // 真实画面首帧 conf/box 范围统计（仅OPT模型诊断用，1次）
+    private int estimateCallCount = 0;          // 调用计数：probe=1, 真实画面首帧=2
 
     // ===== PoC: 双实例并发推理（榨 GPU 并行算力）=====
     // 目的：验证 TFLite 双 GpuDelegate 实例能否真并发，榨干 GPU 空闲算力且端到端不卡。
@@ -626,6 +627,7 @@ public class PoseEstimator {
     }
 
     public PersonPose estimate(Bitmap bitmap) {
+        estimateCallCount++;
         originalWidth = bitmap.getWidth();
         originalHeight = bitmap.getHeight();
         // 动态亮度：每帧重置标记，主路 bitmapToByteBuffer 只计算一次（第二路复用主路结果）
@@ -1040,24 +1042,11 @@ public class PoseEstimator {
         PersonPose best = null;
         float maxScore = -1f;
         for (int i = 0; i < numPredictions; i++) {
-            float boxConf;
-            if (boxIsXyxy) {
-                // OPT 模型 (YOLOv8 Detect folded): raw logits → Java 端手动 sigmoid → boxConf = σ(obj) * σ(max_cls)
-                float objRaw = getOutputValue2(4, i);
-                float clsRaw = 0f;
-                for (int c = 5; c < numChannels; c++) {
-                    float cf = getOutputValue2(c, i);
-                    if (cf > clsRaw) clsRaw = cf;
-                }
-                float objConf = 1f / (1f + (float) Math.exp(-objRaw));
-                float clsConf = 1f / (1f + (float) Math.exp(-clsRaw));
-                boxConf = objConf * clsConf;
-            } else {
-                boxConf = 0;
-                for (int c = 4; c < numChannels; c++) {
-                    float conf = getOutputValue2(c, i);
-                    if (conf > boxConf) boxConf = conf;
-                }
+            // OPT和非OPT的conf通道输出模式一致（均含sigmoid），统一取ch4+的max
+            float boxConf = 0;
+            for (int c = 4; c < numChannels; c++) {
+                float conf = getOutputValue2(c, i);
+                if (conf > boxConf) boxConf = conf;
             }
             if (boxConf < VALID_DETECTION_CONF) continue;
             float cx, cy, w, h;
@@ -1153,9 +1142,9 @@ public class PoseEstimator {
     private PersonPose parseOutput() {
         int numPredictions = numAnchors;
 
-        // ========== OPT模型真实首帧诊断：统计obj/cls通道raw范围 + 是否需sigmoid ==========
-        // probe是黑图(firstInferLogged=true表示probe已跑完)，接下来第一次真实画面调用才统计，只跑1次
-        if (boxIsXyxy && firstInferLogged && !realStatsLogged) {
+        // ========== 真实首帧诊断：统计conf通道raw范围（所有模型，对比OPT vs 非OPT） ==========
+        // probe是第1次调用(黑图)，第2次调用才是真实画面 → 用estimateCallCount跳过probe
+        if (estimateCallCount >= 2 && !realStatsLogged) {
             realStatsLogged = true;
             float objMin = Float.MAX_VALUE, objMax = -Float.MAX_VALUE;
             float clsMin = Float.MAX_VALUE, clsMax = -Float.MAX_VALUE;
@@ -1259,26 +1248,12 @@ public class PoseEstimator {
         boolean bestMatchedTrack = false;
 
         for (int i = 0; i < numPredictions; i++) {
-            float boxConf;
-            if (boxIsXyxy) {
-                // OPT 模型 (YOLOv8 Detect folded): raw logits → Java 端手动 sigmoid → boxConf = σ(obj) * σ(max_cls)
-                float objRaw = getOutputValue(4, i);
-                float clsRaw = 0f;
-                for (int c = 5; c < numChannels; c++) {
-                    float cf = getOutputValue(c, i);
-                    if (cf > clsRaw) clsRaw = cf;
-                }
-                // onnx2tf 导出 box decode 折叠时把 sigmoid 留在了图外（logit 直通输出），Java 端手动补
-                float objConf = 1f / (1f + (float) Math.exp(-objRaw));
-                float clsConf = 1f / (1f + (float) Math.exp(-clsRaw));
-                boxConf = objConf * clsConf;
-            } else {
-                boxConf = 0;
-                for (int c = 4; c < numChannels; c++) {
-                    float conf = getOutputValue(c, i);
-                    if (conf > boxConf) {
-                        boxConf = conf;
-                    }
+            // OPT和非OPT的conf通道输出模式一致（均含sigmoid），统一取ch4+的max
+            float boxConf = 0;
+            for (int c = 4; c < numChannels; c++) {
+                float conf = getOutputValue(c, i);
+                if (conf > boxConf) {
+                    boxConf = conf;
                 }
             }
             // ByteTrack: 第一阶段阈值用 HIGH；低于 HIGH 但 >= LOW 暂存为候选项
