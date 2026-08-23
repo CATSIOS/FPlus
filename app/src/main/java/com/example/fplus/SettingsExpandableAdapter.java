@@ -4,6 +4,7 @@ import android.content.Context;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.AbsListView;
 import android.widget.BaseExpandableListAdapter;
 import android.widget.RadioGroup;
 import android.widget.TextView;
@@ -11,9 +12,15 @@ import android.widget.TextView;
 /**
  * 原生 ExpandableListView 设置页风格 Adapter（Android Settings 样式）。
  * <p>
- * 构造时预 inflate 两个 child view，避免在 getChildView 中复用失败导致
- * RadioGroup 引用 NPE；MainActivity 直接通过 {@link #getModelRadioGroup()}
- * / {@link #getBackendRadioGroup()} 拿引用，id 与原 layout 完全一致。
+ * 修正 v5.8 四处闪退根因：
+ *   1) groupIndicator 用 arrow_down_float（API29+独占资源）→ 系统默认 indicator；
+ *   2) 构造预 inflate 时 parent=null → getChildView 首次调用时补
+ *      AbsListView.LayoutParams(MATCH_PARENT, WRAP_CONTENT)，保证测量正确；
+ *   3) getChildView 返回已缓存 view 时若 view.getParent() != null 会触发
+ *      IllegalStateException("child already has a parent") → 返回前先
+ *      从旧父容器 removeView()，允许 ListView 重绘 / 反复展开折叠重复使用；
+ *   4) 改为"延迟加载"会让 MainActivity.onCreate 里 getModelRadioGroup()
+ *      返回 null 引发 NPE → 保留构造预 inflate，保证取引用非空。
  */
 public class SettingsExpandableAdapter extends BaseExpandableListAdapter {
 
@@ -21,7 +28,7 @@ public class SettingsExpandableAdapter extends BaseExpandableListAdapter {
     private final LayoutInflater mInflater;
     private final String[] mGroups;
 
-    // 构造预加载，防 NPE
+    // 构造预加载（保证取引用非空，LayoutParams 在 getChildView 里补）
     private final View mChildModel;
     private final View mChildBackend;
 
@@ -30,6 +37,7 @@ public class SettingsExpandableAdapter extends BaseExpandableListAdapter {
         mInflater = LayoutInflater.from(context);
         mGroups = groups != null ? groups : new String[]{"模型", "推理后端"};
 
+        // parent=null 只为能在构造时 inflate；LayoutParams 在 getChildView 补
         mChildModel = mInflater.inflate(R.layout.settings_child_model, null, false);
         mChildBackend = mInflater.inflate(R.layout.settings_child_backend, null, false);
     }
@@ -65,8 +73,21 @@ public class SettingsExpandableAdapter extends BaseExpandableListAdapter {
     @Override
     public View getChildView(int groupPosition, int childPosition,
                              boolean isLastChild, View convertView, ViewGroup parent) {
-        // 只两个 child，不复用，直接返回预加载的 view，避免 RadioGroup 状态丢失 / NPE
-        return groupPosition == 0 ? mChildModel : mChildBackend;
+        View v = groupPosition == 0 ? mChildModel : mChildBackend;
+
+        // 修复构造时 inflate(parent=null) 导致 LayoutParams 缺失
+        ViewGroup.LayoutParams lp = v.getLayoutParams();
+        if (!(lp instanceof AbsListView.LayoutParams)) {
+            v.setLayoutParams(new AbsListView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+
+        // 防止 ListView 重绘 / 折叠再展开时重复 addView 崩 IllegalStateException
+        if (v.getParent() != null && v.getParent() instanceof ViewGroup) {
+            ((ViewGroup) v.getParent()).removeView(v);
+        }
+        return v;
     }
 
     @Override public boolean isChildSelectable(int groupPosition, int childPosition) { return true; }

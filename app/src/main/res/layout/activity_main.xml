@@ -41,8 +41,6 @@
             android:paddingEnd="16dp"
             android:divider="#1AFFFFFF"
             android:dividerHeight="1dp"
-            android:childDivider="@null"
-            android:groupIndicator="@android:drawable/arrow_down_float"
             android:listSelector="@android:color/transparent"
             android:fastScrollEnabled="false" />
 
