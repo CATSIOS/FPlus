@@ -15,18 +15,6 @@
         android:text="@string/model_default" />
 
     <RadioButton
-        android:id="@+id/radio_model_nhwc"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="@string/model_nhwc" />
-
-    <RadioButton
-        android:id="@+id/radio_model_int8"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="@string/model_int8" />
-
-    <RadioButton
         android:id="@+id/radio_model_416"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"

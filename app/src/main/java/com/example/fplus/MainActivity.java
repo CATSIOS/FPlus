@@ -27,8 +27,6 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE_CAPTURE = 2002;
 
     private static final String MODEL_DEFAULT = "sunxds_0.8.0.tflite";
-    private static final String MODEL_NHWC = "sunxds_0.8.0_float32.tflite";
-    private static final String MODEL_INT8 = "sunxds_0.8.0_w8a16.tflite";
     private static final String MODEL_416 = "sunxds_0.8.0_416.tflite";
     private static final String MODEL_320_OPT = "sunxds_0.8.0_320_opt.tflite";
     private static final String MODEL_416_OPT = "sunxds_0.8.0_416_opt.tflite";
@@ -287,8 +285,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String modelLabel(String model) {
-        if (MODEL_NHWC.equals(model)) return "640/NHWC";
-        if (MODEL_INT8.equals(model)) return "640/INT8";
         if (MODEL_416.equals(model)) return "416";
         if (MODEL_320_OPT.equals(model)) return "320/OPT(原生训练)";
         if (MODEL_416_OPT.equals(model)) return "416/OPT(简化)";
@@ -323,8 +319,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private int checkedIdForModel(String model) {
-        if (MODEL_NHWC.equals(model)) return R.id.radio_model_nhwc;
-        if (MODEL_INT8.equals(model)) return R.id.radio_model_int8;
         if (MODEL_416.equals(model)) return R.id.radio_model_416;
         if (MODEL_320_OPT.equals(model)) return R.id.radio_model_320_opt;
         if (MODEL_416_OPT.equals(model)) return R.id.radio_model_416_opt;
@@ -332,8 +326,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String modelForCheckedId(int checkedId) {
-        if (checkedId == R.id.radio_model_nhwc) return MODEL_NHWC;
-        if (checkedId == R.id.radio_model_int8) return MODEL_INT8;
         if (checkedId == R.id.radio_model_416) return MODEL_416;
         if (checkedId == R.id.radio_model_320_opt) return MODEL_320_OPT;
         if (checkedId == R.id.radio_model_416_opt) return MODEL_416_OPT;

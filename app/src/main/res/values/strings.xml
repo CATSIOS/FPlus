@@ -7,12 +7,10 @@
     <string name="backend_gpu">GPU 推理</string>
     <string name="backend_cpu">CPU 推理</string>
     <string name="model_option_title">模型</string>
-    <string name="model_default">640 输入（NCHW）</string>
-    <string name="model_nhwc">640 输入（NHWC）</string>
-    <string name="model_int8">640 输入（INT8 量化）</string>
-    <string name="model_416">416 输入</string>
-    <string name="model_320_opt">320 输入（原生训练尺寸 ⚡最快）</string>
-    <string name="model_416_opt">416 输入（ONNX简化 更流畅）</string>
+    <string name="model_default">Input 640 NCHW</string>
+    <string name="model_416">Input 416 NCHW</string>
+    <string name="model_320_opt">Input 320 NHWC OPT</string>
+    <string name="model_416_opt">Input 416 NHWC OPT</string>
     <string name="btn_start">开始</string>
     <string name="btn_stop">停止</string>
     <string name="btn_benchmark">自动测速</string>

@@ -256,6 +256,34 @@ public class PoseEstimator {
     // OA-SORT BAM：上一帧 bestPose 的遮挡系数 [0,1]，本帧 trackedBox 更新时降低对观测的信任
     private float lastBestOcclusion = 0f;
 
+    // ===== 自适应外推阻尼（残差反馈自学习）=====
+    // 问题：固定 PREDICT_SECONDS 外推，目标匀速时贴脸、急停/急转时绿框「冲过头」（前推过冲）。
+    // 方案：让外推提前量「自主学习」——每帧用「本帧观测位置」与「上帧预测位置」的残差闭环调节：
+    //   观测落在预测前方（残差沿外推方向为正）→ 外推不足 → 增大提前量；
+    //   观测落在预测后方（残差为负）→ 外推过度 → 减小提前量。
+    // 用 EMA 累积残差 + 死区，避免单帧噪声误调，等效一个带死区的积分控制器。
+    private float adaptiveLeadSec = 0.083f;   // 当前有效外推提前量（秒），初值 = PREDICT_SECONDS
+    private float leadErrEma = 0f;            // 外推残差 EMA（像素，沿外推方向为正 = 外推不足）
+    private float lastLeadDx = 0f;            // 上一帧显示外推量 x（像素）
+    private float lastLeadDy = 0f;            // 上一帧显示外推量 y（像素）
+    private boolean leadValid = false;        // 上帧是否有有效外推（有速度才外推）
+    private int leadLogCounter = 0;           // 自适应外推日志限频计数
+    private int detLogCounter = 0;            // 检测诊断日志限频计数
+
+    // ===== 切换滞后（anti-ID-switch hysteresis）=====
+    // 问题：两个清晰人物 conf 都 ≥ TAKEOVER_CONF 时，单帧评分波动会让绿框在两人间反复横跳。
+    // 方案：新目标需连续 SWITCH_CONFIRM_FRAMES 帧保持最优才接管；中途换成别的候选则重置计数。
+    //   用「候选框中心距离」判断连续帧是否为同一候选（同一目标帧间位移 < SWITCH_SAME_DIST）。
+    private float[] switchCandidateBox = null;  // 待切换新目标框（像素）
+    private int switchCandidateFrames = 0;      // 已连续领先的帧数
+    private static final int SWITCH_CONFIRM_FRAMES = 3;  // 确认帧数（@30fps ≈ 0.1s）
+    private static final float SWITCH_SAME_DIST = 30f;   // 判定「同一候选」的中心距离阈值（像素）
+    private static final float LEAD_ERR_EMA_ALPHA = 0.15f;  // 残差 EMA 系数
+    private static final float LEAD_DEADZONE = 2.0f;        // 残差死区（像素），小于此不调
+    private static final float LEAD_ADAPT_STEP = 0.004f;    // 每次调整步长（秒）
+    private static final float LEAD_MAX = 0.083f;           // 外推上限 = 默认 PREDICT_SECONDS
+    private static final float LEAD_MIN = 0.0f;             // 外推下限（可退到 0=完全不外推）
+
     // 分阶段计时统计
     private long preprocessAccum;
     private long convertAccum;
@@ -1449,16 +1477,44 @@ public class PoseEstimator {
             }
         }
 
-        // HIGH 阶段若已选到"非跟踪目标"的高分框（例如画面边缘另一个人突然出现），
-        // 但当前仍在锁定中，我们不应该抢走锁定。逻辑：在 trackedBox 仍有效（lostFrames 不大）
-        // 情况下，如果 bestMatchedTrack == false 说明 HIGH 选的不是当前目标，保持旧 trackedBox
-        // 例外：若新目标置信度 ≥ TAKEOVER_CONF（清晰人物突然入场），允许立即接管，
-        // 避免被压制 MAX_TRACK_LOST 帧造成的 0.5s+ 入场延迟
+        // HIGH 阶段若已选到"非跟踪目标"的高分框（例如画面里另一个人），
+        // 但当前仍在锁定中，我们不应该轻易抢走锁定，否则两个清晰目标间会反复横跳。
+        // 方案：切换滞后——新目标需连续 SWITCH_CONFIRM_FRAMES 帧保持最优才接管。
+        //   置信度 < TAKEOVER_CONF 直接拒绝（保持旧目标）；置信度足够则进入候选确认，
+        //   连续多帧领先才切换，单帧评分波动不会触发横跳。
         if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack
-                && bestPose != null && !rescuedByLow && bestConf < TAKEOVER_CONF) {
-            // 不接受这个新目标（把 bestPose 置空，交给 lost++ 逻辑，让跟踪继续沿用旧轨迹）
-            bestPose = null;
-            bestConf = 0f;
+                && bestPose != null && !rescuedByLow) {
+            if (bestConf < TAKEOVER_CONF) {
+                // 置信度不足，拒绝接管
+                bestPose = null;
+                bestConf = 0f;
+                switchCandidateBox = null;
+                switchCandidateFrames = 0;
+            } else {
+                // 置信度足够，判断是否与上一帧候选是同一目标（中心距离接近）
+                boolean sameCandidate = switchCandidateBox != null
+                        && Math.abs(switchCandidateBox[0] - bestPose.box[0]) < SWITCH_SAME_DIST
+                        && Math.abs(switchCandidateBox[1] - bestPose.box[1]) < SWITCH_SAME_DIST;
+                if (sameCandidate) {
+                    switchCandidateFrames++;
+                } else {
+                    switchCandidateBox = bestPose.box.clone();
+                    switchCandidateFrames = 1;
+                }
+                if (switchCandidateFrames < SWITCH_CONFIRM_FRAMES) {
+                    // 尚未连续确认，暂不切换，保持旧目标
+                    bestPose = null;
+                    bestConf = 0f;
+                } else {
+                    // 连续多帧领先，确认切换
+                    switchCandidateBox = null;
+                    switchCandidateFrames = 0;
+                }
+            }
+        } else {
+            // 当前选中的是跟踪目标（或无需保护），清空切换候选
+            switchCandidateBox = null;
+            switchCandidateFrames = 0;
         }
 
         // ===== OA-SORT OAM：计算当前 bestPose 被其他 HIGH 检测框遮挡的系数 =====
@@ -1513,6 +1569,41 @@ public class PoseEstimator {
                     trackVelY = (1 - adaptiveAlpha) * trackVelY + adaptiveAlpha * rawVy;
                 }
             }
+
+            // ===== 自适应外推阻尼反馈：残差 = 本帧观测 - 上帧(跟踪位置 + 外推量) =====
+            // 此处 trackedBox 仍是「上一帧观测位置」，newBox 是「本帧观测位置」，
+            // lastLeadDx/Dy 是上一帧显示外推量。若外推准确，本帧观测应落在
+            // 「上一帧观测 + 上一帧外推」附近；残差沿外推方向为正表示外推不足，为负表示过冲。
+            if (leadValid) {
+                float predX = trackedBox[0] + lastLeadDx;
+                float predY = trackedBox[1] + lastLeadDy;
+                float errX = newBox[0] - predX;
+                float errY = newBox[1] - predY;
+                float leadLen = (float) Math.sqrt(lastLeadDx * lastLeadDx + lastLeadDy * lastLeadDy);
+                float leadErr = 0f;
+                if (leadLen > 1e-3f) {
+                    // 残差在外推方向上的投影（带符号）
+                    leadErr = (errX * lastLeadDx + errY * lastLeadDy) / leadLen;
+                }
+                leadErrEma = (1f - LEAD_ERR_EMA_ALPHA) * leadErrEma + LEAD_ERR_EMA_ALPHA * leadErr;
+                if (leadErrEma > LEAD_DEADZONE) {
+                    // 外推不足 → 增大提前量（跟得更贴）
+                    adaptiveLeadSec = Math.min(LEAD_MAX, adaptiveLeadSec + LEAD_ADAPT_STEP);
+                    if (++leadLogCounter % 15 == 0) {
+                        Log.d(TAG, "自适应外推↑ lead=" + String.format(java.util.Locale.US, "%.4f", adaptiveLeadSec)
+                                + "s errEma=" + String.format(java.util.Locale.US, "%.1f", leadErrEma) + "px");
+                    }
+                } else if (leadErrEma < -LEAD_DEADZONE) {
+                    // 外推过度 → 减小提前量（抑制冲过头）
+                    adaptiveLeadSec = Math.max(LEAD_MIN, adaptiveLeadSec - LEAD_ADAPT_STEP);
+                    if (++leadLogCounter % 15 == 0) {
+                        Log.d(TAG, "自适应外推↓ lead=" + String.format(java.util.Locale.US, "%.4f", adaptiveLeadSec)
+                                + "s errEma=" + String.format(java.util.Locale.US, "%.1f", leadErrEma) + "px");
+                    }
+                }
+                leadValid = false; // 本次外推量已消费
+            }
+
             trackedBox = newBox;
             lastBestOcclusion = currentOcclusion;
             trackLostFrames = 0;
@@ -1530,19 +1621,28 @@ public class PoseEstimator {
             }
         }
 
-        // ===== 预测未来位置（方案 A + B）=====
-        // 用当前速度外推 PREDICT_SECONDS 秒后的位置，抵消检测→显示端到端延迟
+        // ===== 预测未来位置（方案 A + B，外推提前量自适应学习）=====
+        // 用当前速度外推 adaptiveLeadSec 秒后的位置，抵消检测→显示端到端延迟
         // 静止目标（速度低于 MIN_VEL）不外推，避免静止时绿框漂移（方案 B）
         // 注意：bestPose.box 是独立 new 出来的引用，trackedBox 已 clone，互不影响
-        // trackVelX 单位：60fps 基准每帧位移，× 60 转换为"每秒位移"再 × PREDICT_SECONDS
+        // trackVelX 单位：60fps 基准每帧位移，× 60 转换为"每秒位移"再 × adaptiveLeadSec
         if (bestPose != null && trackedBox != null) {
             float speedSq = trackVelX * trackVelX + trackVelY * trackVelY;
             if (speedSq >= MIN_VEL * MIN_VEL) {
-                float predDx = trackVelX * 60f * PREDICT_SECONDS;
-                float predDy = trackVelY * 60f * PREDICT_SECONDS;
+                float predDx = trackVelX * 60f * adaptiveLeadSec;
+                float predDy = trackVelY * 60f * adaptiveLeadSec;
                 bestPose.box[0] += predDx;
                 bestPose.box[1] += predDy;
+                lastLeadDx = predDx;
+                lastLeadDy = predDy;
+                leadValid = true;
+            } else {
+                lastLeadDx = 0f;
+                lastLeadDy = 0f;
+                leadValid = false;
             }
+        } else {
+            leadValid = false;
         }
 
         // OC-SORT Coast（速度外推）：丢失期间用瞬时速度外推位置继续显示绿框，
@@ -1563,6 +1663,16 @@ public class PoseEstimator {
                         trackedBox[3]
                 };
             }
+        }
+
+        // 检测诊断：低频打印选中目标的置信度/高宽比/面积，用于对比「背景物体 vs 真实人物」特征
+        if (bestPose != null && bestPose.box != null && ++detLogCounter % 30 == 0) {
+            float ar = bestPose.box[3] / Math.max(1f, bestPose.box[2]); // 高/宽比（人物竖长 >1，箱子方形 ≈1）
+            float areaNorm = bestPose.box[2] * bestPose.box[3] / (originalWidth * originalHeight);
+            Log.d(TAG, "选中目标 conf=" + String.format(java.util.Locale.US, "%.2f", bestConf)
+                    + " 高宽比=" + String.format(java.util.Locale.US, "%.2f", ar)
+                    + " 面积norm=" + String.format(java.util.Locale.US, "%.3f", areaNorm)
+                    + " 尺寸=" + (int) bestPose.box[2] + "x" + (int) bestPose.box[3] + "px");
         }
 
         return bestPose;
