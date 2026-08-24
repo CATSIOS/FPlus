@@ -90,6 +90,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "横向断连补分强度（0~0.5）", GROUP_TRACKING, 0, 0.5));
         params.add(new ParamItem("track_acc_threshold", "0.002", "加速度阈值",
                 "CA 外推触发加速度（0~0.02）", GROUP_TRACKING, 0, 0.02));
+        params.add(new ParamItem("anti_crosshair", "0", "抗准心误识别（实验）",
+                "开镜瞄具/准心UI误绑定时启用：超小+中心+非人形比例才惩罚，不影响真人", GROUP_TRACKING, 0, 1));
 
         params.add(new ParamItem("pred_seconds", "0.083", "预测时长（秒）",
                 "绿框提前量，抵消延迟（0~0.2）", GROUP_PREDICT, 0, 0.2));
@@ -106,6 +108,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         params.add(new ParamItem("roi_scale", "0.7", "ROI 尺寸",
                 "检测区域占比（0.3~1.0）", GROUP_ROI, 0.3, 1.0));
 
+        params.add(new ParamItem("bright_auto", "1", "启用环境光优化",
+                "根据画面亮度动态调整增益+暗部抬升（关则只使用固定增益）", GROUP_BRIGHT, 0, 1));
         params.add(new ParamItem("bright_gain", "1.3", "亮度增益",
                 "对比度提升（0.5~3.0）", GROUP_BRIGHT, 0.5, 3.0));
         params.add(new ParamItem("bright_offset", "25", "亮度偏移",
@@ -124,12 +128,17 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
 
         params.add(new ParamItem("dual_infer", "0", "双实例并发",
                 "开启第二路放大区推理，榨GPU算力", GROUP_DUAL, 0, 1));
+        params.add(new ParamItem("dual_verify", "0", "双路交叉核验（实验）",
+                "双路开时生效：放大区主路候选需第二路同位置也检出才采信，降权背景误识别", GROUP_DUAL, 0, 1));
         params.add(new ParamItem("dual_zoom", "0.5", "放大区比例",
                 "第二路区域相对ROI（0.3~0.8，越小放大越大）", GROUP_DUAL, 0.3, 0.8));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();
-    private Switch dualSwitch;  // dual_infer 用开关控件，editTexts 对应槽位存 null 占位
+    private Switch dualSwitch;         // dual_infer 用开关控件，editTexts 对应槽位存 null 占位
+    private Switch dualVerifySwitch;   // dual_verify 实验开关，editTexts 槽位存 null 占位
+    private Switch antiCrosshairSwitch;// anti_crosshair 抗准心开关，editTexts 槽位存 null 占位
+    private Switch brightAutoSwitch;   // bright_auto 环境光优化开关，editTexts 槽位存 null 占位
     private SharedPreferences prefs;
 
     @Override
@@ -211,7 +220,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
 
             row.addView(textCol);
 
-            // 右侧控件：dual_infer 用开关，其余用数值输入框
+            // 右侧控件：dual_infer / dual_verify / bright_auto 用开关，其余用数值输入框
             if ("dual_infer".equals(p.key)) {
                 Switch sw = new Switch(this);
                 sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
@@ -222,6 +231,36 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 row.addView(sw, swLp);
                 dualSwitch = sw;
                 editTexts.add(null);  // 占位保持与 params index 对齐
+            } else if ("dual_verify".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                dualVerifySwitch = sw;
+                editTexts.add(null);
+            } else if ("anti_crosshair".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                antiCrosshairSwitch = sw;
+                editTexts.add(null);
+            } else if ("bright_auto".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked(!"0".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                brightAutoSwitch = sw;
+                editTexts.add(null);
             } else {
                 EditText et = new EditText(this);
                 et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
@@ -255,6 +294,18 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             ParamItem p = params.get(i);
             if ("dual_infer".equals(p.key)) {
                 editor.putString(p.key, dualSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("dual_verify".equals(p.key)) {
+                editor.putString(p.key, dualVerifySwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("anti_crosshair".equals(p.key)) {
+                editor.putString(p.key, antiCrosshairSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("bright_auto".equals(p.key)) {
+                editor.putString(p.key, brightAutoSwitch.isChecked() ? "1" : "0");
                 continue;
             }
             String val = editTexts.get(i).getText().toString().trim();
@@ -295,11 +346,24 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         editor.apply();
         // 刷新 UI 显示默认值
         for (int i = 0; i < params.size(); i++) {
-            if ("dual_infer".equals(params.get(i).key)) {
-                dualSwitch.setChecked("1".equals(params.get(i).defValue));
+            ParamItem p = params.get(i);
+            if ("dual_infer".equals(p.key)) {
+                dualSwitch.setChecked("1".equals(p.defValue));
                 continue;
             }
-            editTexts.get(i).setText(params.get(i).defValue);
+            if ("dual_verify".equals(p.key)) {
+                dualVerifySwitch.setChecked("1".equals(p.defValue));
+                continue;
+            }
+            if ("anti_crosshair".equals(p.key)) {
+                antiCrosshairSwitch.setChecked("1".equals(p.defValue));
+                continue;
+            }
+            if ("bright_auto".equals(p.key)) {
+                brightAutoSwitch.setChecked(!"0".equals(p.defValue));
+                continue;
+            }
+            editTexts.get(i).setText(p.defValue);
         }
         Toast.makeText(this, "已恢复默认值", Toast.LENGTH_SHORT).show();
     }

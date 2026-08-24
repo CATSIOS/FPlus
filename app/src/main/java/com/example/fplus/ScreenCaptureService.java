@@ -103,12 +103,9 @@ public class ScreenCaptureService extends Service {
         }
 
         // 屏幕捕获授权已在 MainActivity 中获得，此时才能以 mediaProjection 类型启动前台服务
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, buildNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
-        } else {
-            startForeground(NOTIFICATION_ID, buildNotification());
-        }
+        // minSdk=29 ≥ Q，直接带 FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION 启动
+        startForeground(NOTIFICATION_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
 
         SharedPreferences prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
         String backendName = prefs.getString("backend", PoseEstimator.Backend.GPU.name());
@@ -402,14 +399,13 @@ public class ScreenCaptureService extends Service {
     }
 
     private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Screen Capture Service",
-                    NotificationManager.IMPORTANCE_LOW);
-            NotificationManager manager = getSystemService(NotificationManager.class);
-            manager.createNotificationChannel(channel);
-        }
+        // minSdk=29 ≥ O，NotificationChannel 必填
+        NotificationChannel channel = new NotificationChannel(
+                CHANNEL_ID,
+                "Screen Capture Service",
+                NotificationManager.IMPORTANCE_LOW);
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        manager.createNotificationChannel(channel);
     }
 
     private Notification buildNotification() {

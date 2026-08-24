@@ -142,6 +142,11 @@ public class OverlayView extends View {
             } else {
                 lostAtNanos = 0;
             }
+            // 目标消失：清除 1€ 滤波器缓存（xHat/dxHat/xPrev），
+            // 否则下一个目标（B）到来时 filter 会携带旧目标（A）的位置/速度惯性，
+            // 绿框从 A 平滑滑到 B（表现为横跳/滑动）。reset 后 B 首次滤波直接落到 B 位置。
+            if (filterX != null) filterX.reset();
+            if (filterY != null) filterY.reset();
             // 无论绿框是否还在淡出，都要重绘：黄圈（ROI）回正需要持续刷新
             invalidate();
             return;

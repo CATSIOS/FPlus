@@ -117,24 +117,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 检查悬浮窗权限
+     * 检查悬浮窗权限（minSdk=29 ≥ M，无版本分支判断）
      */
     private boolean checkOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            return Settings.canDrawOverlays(this);
-        }
-        return true; // Android 6.0 以下默认有权限
+        return Settings.canDrawOverlays(this);
     }
 
     /**
      * 请求悬浮窗权限
      */
     private void requestOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName()));
-            startActivityForResult(intent, REQUEST_CODE_OVERLAY_PERMISSION);
-        }
+        Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + getPackageName()));
+        startActivityForResult(intent, REQUEST_CODE_OVERLAY_PERMISSION);
     }
 
     @Override
@@ -170,11 +165,8 @@ public class MainActivity extends AppCompatActivity {
         Intent serviceIntent = new Intent(this, ScreenCaptureService.class);
         serviceIntent.putExtra("resultCode", resultCode);
         serviceIntent.putExtra("resultData", resultData);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent);
-        } else {
-            startService(serviceIntent);
-        }
+        // minSdk=29 ≥ O，直接 startForegroundService
+        startForegroundService(serviceIntent);
         Toast.makeText(this, "服务已启动", Toast.LENGTH_SHORT).show();
         Button btnStart = findViewById(R.id.btn_start);
         btnStart.setText(R.string.btn_stop);

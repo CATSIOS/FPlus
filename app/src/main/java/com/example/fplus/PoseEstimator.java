@@ -61,20 +61,34 @@ public class PoseEstimator {
     private static final float INV_255 = 1f / 255f;
     // 亮度/对比度增强：游戏场景偏暗，提亮有助于提升检测率
     // USER_* = 高级选项用户手动设置的基础值；CUR_* = 当前帧实际应用值（USER_* 乘动态补偿倍率 mult）
+    private boolean BRIGHT_AUTO_ENABLED = true;  // 高级选项"启用环境光优化"，true=动态增益+暗部抬升，false=只使用 USER_* 基础值
     private float USER_BRIGHT_GAIN = 1.3f;
     private float USER_BRIGHT_OFFSET = 25f;
     private float CUR_BRIGHT_GAIN = 1.3f;
     private float CUR_BRIGHT_OFFSET = 25f;
     private float CUR_BRIGHT_OFFSET_NORM;
-    // 动态亮度配置：目标平均亮度(0~255)、EMA平滑系数、重建LUT的变化阈值、补偿倍率上下限
-    private static final float TARGET_AVG_LUMA = 90f;
+    // 动态亮度配置：场景亮度用 P90 高分位（替代平均亮度，避免"亮环境+黑物体"误判为暗）、
+    // EMA平滑系数、重建LUT的变化阈值、补偿倍率上下限
+    private static final float TARGET_P90_LUMA = 150f;   // 期望的 P90 亮度：亮场景不提亮，暗场景提亮
     private static final float LUM_EMA_ALPHA = 0.3f;
     private static final float REBUILD_GAIN_RATIO = 0.05f;  // ±5% 变化才重建 LUT
     private static final float REBUILD_OFFSET_ABS = 3.0f;    // 绝对值±3 才重建
     private static final float MIN_MULT = 0.75f;
     private static final float MAX_MULT = 1.8f;
+    // 暗部抬升（方案B）：仅当"场景亮(P90 高) + 对比度大(亮背景/黑物体)"时启用，
+    // 用分段曲线把阴影区抬升、亮部不动，既看清黑物体又不整体发灰
+    private static final float SHADOW_LIFT_BRIGHT_MIN = 120f;  // P90 ≥ 此值视为场景亮
+    private static final float SHADOW_LIFT_EVDIFF_MIN = 70f;   // 亮部12%均值 − 暗部12%均值 ≥ 此值视为高对比
+    private static final float SHADOW_LIFT_MAX = 0.25f;        // 最大抬升强度（归一化亮度域 0~1）
+    private static final float SHADOW_LIFT_CUTOFF = 0.45f;     // 阴影判定截止（输入亮度 ≥ 此值不抬升）
+    private static final float SHADOW_LIFT_EMA_ALPHA = 0.2f;   // 抬升强度平滑，防 LUT 跳变
+    private static final float SHADOW_REBUILD_ABS = 0.02f;     // 抬升强度变化 ≥ 此值才重建 LUT
+    private static final int LUM_HIST_BINS = 32;               // 亮度直方图分桶（每桶 8 级）
     // 动态亮度状态字段
-    private float emaAvgL = -1f;  // -1 表示未初始化
+    private float emaP90 = -1f;      // P90 场景亮度的 EMA（-1 表示未初始化）
+    private float shadowLift = 0f;   // 当前暗部抬升强度（EMA 平滑后的 0~SHADOW_LIFT_MAX）
+    private float lastRebuildShadow = -1f;
+    private boolean shadowLiftLogged = false;  // 暗部抬升首次激活日志（验证用，只打一次）
     private float lastRebuildGain = -1f;
     private float lastRebuildOffset = -1f;
     private boolean dynBrightComputed = false;
@@ -112,14 +126,30 @@ public class PoseEstimator {
     private int numScoreClasses = 0;  // multiOutput 模式下 score 的通道数
     private boolean firstInferLogged = false;  // 第1帧推理后打 WARN 日志，查真实数值
     private boolean realStatsLogged = false;   // 真实画面首帧 conf/box 范围统计（仅OPT模型诊断用，1次）
+    private boolean dualVerifyWarned = false;  // 双路交叉核验首次命中FP惩罚的诊断日志（只打1次）
+    private boolean antiCrosshairWarned = false;// 抗准心首次命中惩罚的诊断日志（只打1次）
     private int estimateCallCount = 0;          // 调用计数：probe=1, 真实画面首帧=2
 
     // ===== PoC: 双实例并发推理（榨 GPU 并行算力）=====
     // 目的：验证 TFLite 双 GpuDelegate 实例能否真并发，榨干 GPU 空闲算力且端到端不卡。
     // 第二路跑「中心放大区」（ROI 中心 zoomSize 正方形缩放到 640），远处小目标放大后更易检出。
     // 第二套资源与主路完全隔离，避免并发时 pixels/floats/buffer/canvas 字段冲突。
+    // 目标误识别过滤：抗准心/瞄具 UI 误绑定（开镜场景中心准心误识别为小人）。默认关。
+    // 只惩罚置信度（×0.35），不硬移除，lock 不受直接影响；必须同时满足3条才罚：
+    //   (1) 候选中心与画面几何中心距离 < 1.2% 屏幕对角线（准心永远居中）
+    //   (2) 高宽比 h/w 不在真人形范围 [1.6, 3.6]（正圆/十字瞄具通常 h/w 0.8~1.5）
+    //   (3) 尺寸足够小：宽 < 2.2% 屏幕宽 且 高 < 2.8% 屏幕高
+    private boolean ANTI_CROSSHAIR_ENABLED = false;
+    private static final float AC_DIST_RATIO = 0.012f;
+    private static final float AC_HW_MIN = 1.6f;
+    private static final float AC_HW_MAX = 3.6f;
+    private static final float AC_W_RATIO_MAX = 0.022f;
+    private static final float AC_H_RATIO_MAX = 0.028f;
+    private static final float AC_PENALTY = 0.35f;
+
     // PoC1 阶段：不融合第二路结果到主路跟踪，仅日志对比检出差异 + 并发性能数据。
     private boolean DUAL_INFER_ENABLED = false;          // 开关：默认关，保证开关关时行为与单实例逐字节一致
+    private boolean DUAL_VERIFY_ENABLED = false;         // 实验开关：双路交叉核验（双路开才生效），主路放大区候选需第二路同位置也检出才采信
     private float DUAL_ZOOM = 0.5f;                       // 第二路区域相对主 ROI 边长比例（越小放大倍数越大）
     private Interpreter interpreter2;
     private GpuDelegate gpuDelegate2;
@@ -250,6 +280,10 @@ public class PoseEstimator {
     //   仅在「明显移动 + 短时丢失」时外推衔接，解决大幅移动瞬时丢检测的闪烁
     private float COAST_MIN_VEL = 0.01f;
     private int COAST_MAX_FRAMES = 2;
+    // 锁定保持显示窗口：已锁定目标短暂漏检时，补位显示旧目标避免闪烁；
+    // 超过此帧数仍无匹配则判定「目标真消失」，停止补位返回 null 让绿框快速淡出。
+    // 与 MAX_TRACK_LOST(跟踪状态保留 30 帧) 解耦：显示淡出快，跟踪状态保留久以便目标回归时恢复。
+    private static final int LOCK_HOLD_FRAMES = 3;  // ≈75ms @40fps，短暂补位防闪烁，消失更快
     // OA-SORT（CVPR 2026, arxiv 2603.06034）：OAM 深度排序阈值（像素），
     // bbox 底部 y 差值小于此值不判定遮挡，避免抖动误判
     private static final float OAM_DEPTH_THRESHOLD = 5f;
@@ -270,14 +304,19 @@ public class PoseEstimator {
     private int leadLogCounter = 0;           // 自适应外推日志限频计数
     private int detLogCounter = 0;            // 检测诊断日志限频计数
 
-    // ===== 切换滞后（anti-ID-switch hysteresis）=====
-    // 问题：两个清晰人物 conf 都 ≥ TAKEOVER_CONF 时，单帧评分波动会让绿框在两人间反复横跳。
-    // 方案：新目标需连续 SWITCH_CONFIRM_FRAMES 帧保持最优才接管；中途换成别的候选则重置计数。
-    //   用「候选框中心距离」判断连续帧是否为同一候选（同一目标帧间位移 < SWITCH_SAME_DIST）。
-    private float[] switchCandidateBox = null;  // 待切换新目标框（像素）
-    private int switchCandidateFrames = 0;      // 已连续领先的帧数
-    private static final int SWITCH_CONFIRM_FRAMES = 3;  // 确认帧数（@30fps ≈ 0.1s）
-    private static final float SWITCH_SAME_DIST = 30f;   // 判定「同一候选」的中心距离阈值（像素）
+    // ===== 静态图闪烁诊断（临时）：30帧窗口汇总 =====
+    // 目的：区分「模型间歇漏检（topConf 掉到 LOW 以下）」vs「有检测但被选中逻辑吞掉」。
+    // 每帧无论是否选中都累计窗口统计，满 30 帧打一条汇总日志（含 topConf min/max/avg）。
+    private int diagFrame = 0;          // 窗口内帧计数
+    private int diagSelected = 0;       // bestPose 非空帧数
+    private int diagHighFrames = 0;     // 模型输出含 HIGH 框(≥VALID_DETECTION_CONF)的帧数
+    private int diagLowFrames = 0;      // 模型输出含 LOW 框(BYTETRACK_LOW_CONF~HIGH)的帧数
+    private int diagRejected = 0;       // 锁定保持（heldByLock）补位帧数
+    private int diagCoast = 0;          // 锁定保持中速度外推（coast）补位帧数
+    private float diagTopMax = 0f;      // 窗口内「模型最高 conf」的最大值
+    private float diagTopMin = 1f;      // 窗口内「模型最高 conf」的最小值
+    private double diagTopSum = 0;      // 窗口内「模型最高 conf」累加（算均值）
+
     private static final float LEAD_ERR_EMA_ALPHA = 0.15f;  // 残差 EMA 系数
     private static final float LEAD_DEADZONE = 2.0f;        // 残差死区（像素），小于此不调
     private static final float LEAD_ADAPT_STEP = 0.004f;    // 每次调整步长（秒）
@@ -298,6 +337,8 @@ public class PoseEstimator {
 
     public static class PersonPose {
         public float[] box;
+        /** 交叉核验用：此检测路径下的所有 valid 检测框，格式 [px,py,pw,ph,conf]（原图像素坐标） */
+        public java.util.List<float[]> allValidBoxes;
     }
 
     public PoseEstimator(Context context, String modelName, Backend preferred) throws IOException {
@@ -482,18 +523,28 @@ public class PoseEstimator {
         CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f);
         SCORE_W = parseFloat(prefs, "score_w", 0.3f);
         ROI_SCALE = parseFloat(prefs, "roi_scale", 0.7f);
+        // bright_auto：默认开启（"1"/空值 均视为开，"0"才关），与 UI "默认打开"一致
+        String autoStr = prefs.getString("bright_auto", "1");
+        BRIGHT_AUTO_ENABLED = !"0".equals(autoStr);
         USER_BRIGHT_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
         USER_BRIGHT_OFFSET = parseFloat(prefs, "bright_offset", 25f);
         CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN;
         CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET;
         CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
-        emaAvgL = -1f;                 // 重置 EMA，下一帧按新场景重新收敛
+        emaP90 = -1f;                  // 重置 EMA，下一帧按新场景重新收敛
+        shadowLift = 0f;
+        lastRebuildShadow = -1f;
+        shadowLiftLogged = false;
         lastRebuildGain = -1f;         // 下一次必触发 rebuildBrightLut（用新 CUR_*）
         lastRebuildOffset = -1f;
         rebuildBrightLut();  // 亮度参数变化后重建 LUT，convert 遍历用查表替代浮点乘加
-        // 双实例并发 PoC 开关（"1"=开），zoom 比例
+        // 双实例并发 PoC 开关（"1"=开），zoom 比例；交叉核验仅在双路开时生效
         DUAL_INFER_ENABLED = "1".equals(prefs.getString("dual_infer", "0"));
+        DUAL_VERIFY_ENABLED = DUAL_INFER_ENABLED && "1".equals(prefs.getString("dual_verify", "0"));
         DUAL_ZOOM = parseFloat(prefs, "dual_zoom", 0.5f);
+        // 抗准心误识别：独立开关，默认关
+        ANTI_CROSSHAIR_ENABLED = "1".equals(prefs.getString("anti_crosshair", "0"));
+        antiCrosshairWarned = false;
     }
 
     private float parseFloat(SharedPreferences prefs, String key, float def) {
@@ -772,10 +823,11 @@ public class PoseEstimator {
             timingFrames = 0;
         }
 
-        // 第二路结果收集 + 并发性能对比日志（PoC1 阶段不融合，主路 pose 不变）
+        // 第二路结果收集 + 并发性能对比日志 + 可选交叉核验降权（仅 DUAL_VERIFY_ENABLED=开时生效）
+        PersonPose pose2 = null;
         if (f2 != null) {
             try {
-                PersonPose pose2 = f2.get();
+                pose2 = f2.get();
                 long dualEnd = System.nanoTime();
                 long mainInferMs = (t3 - t2) / 1_000_000;
                 long secondInferMs = secondInferNanos.get() / 1_000_000;
@@ -784,6 +836,60 @@ public class PoseEstimator {
                 dual2ndInferAccum += secondInferMs;
                 dualTotalAccum += dualTotalMs;
                 dualFrames++;
+                if (DUAL_VERIFY_ENABLED && pose != null && pose.box != null) {
+                    // ===== 实验：双路交叉核验降权（只惩罚置信度，不硬移除，lock 不受直接影响）=====
+                    // 判定范围：候选 box 中心需在「第二路实际覆盖的正方形 zoomRect」内（否则第二路本就没该处信息，跳过）
+                    float bCx = pose.box[0];
+                    float bCy = pose.box[1];
+                    if (bCx >= zoomX && bCx <= zoomX + zoomSize
+                            && bCy >= zoomY && bCy <= zoomY + zoomSize
+                            && pose2 != null && pose2.allValidBoxes != null && !pose2.allValidBoxes.isEmpty()) {
+                        boolean matched = false;
+                        float bw = pose.box[2];
+                        float bh = pose.box[3];
+                        float maxDist = (originalWidth + originalHeight) * 0.5f * 0.035f;  // 归一化≈3.5%对角线
+                        for (float[] b2 : pose2.allValidBoxes) {
+                            float b2Cx = b2[0], b2Cy = b2[1], b2W = b2[2], b2H = b2[3];
+                            // 距离判定
+                            float ddx = bCx - b2Cx, ddy = bCy - b2Cy;
+                            if (ddx * ddx + ddy * ddy <= maxDist * maxDist) { matched = true; break; }
+                            // IoU 判定（轻量：先算 AABB，C-BIoU 标准）
+                            float b1X1 = bCx - bw * 0.5f, b1Y1 = bCy - bh * 0.5f;
+                            float b1X2 = bCx + bw * 0.5f, b1Y2 = bCy + bh * 0.5f;
+                            float b2X1 = b2Cx - b2W * 0.5f, b2Y1 = b2Cy - b2H * 0.5f;
+                            float b2X2 = b2Cx + b2W * 0.5f, b2Y2 = b2Cy + b2H * 0.5f;
+                            float ix = Math.max(0f, Math.min(b1X2, b2X2) - Math.max(b1X1, b2X1));
+                            float iy = Math.max(0f, Math.min(b1Y2, b2Y2) - Math.max(b1Y1, b2Y1));
+                            float inter = ix * iy;
+                            if (inter <= 0f) continue;
+                            float union = bw * bh + b2W * b2H - inter;
+                            float iou = union > 1e-6f ? inter / union : 0f;
+                            if (iou >= 0.22f) { matched = true; break; }
+                        }
+                        if (!matched) {
+                            // 只做降权（45% 保留），不到 0.25 会低于 HIGH 阈值，无法即时接管 lock
+                            // 惩罚后在整个 track 流程里被同等对待，但接管 lock 需要 TAKEOVER_CONF=0.5 更难
+                            float oldConf = pose.box.length >= 5 ? pose.box[4] : CONFIDENCE_THRESHOLD;
+                            float newConf = oldConf * 0.45f;
+                            if (pose.box.length >= 5) {
+                                pose.box[4] = newConf;
+                            } else {
+                                float[] nb = new float[5];
+                                System.arraycopy(pose.box, 0, nb, 0, 4);
+                                nb[4] = newConf;
+                                pose.box = nb;
+                            }
+                            if (!dualVerifyWarned) {
+                                dualVerifyWarned = true;
+                                Log.i(TAG, "[dual_verify] 命中FP惩罚: 主候选("
+                                        + (int) bCx + "," + (int) bCy + "," + (int) bw + "," + (int) bh
+                                        + ") conf=" + fmt4(oldConf) + "→" + fmt4(newConf)
+                                        + " zoomRect=[" + zoomX + "," + zoomY + "," + zoomSize + "]"
+                                        + " 第二路候选数=" + pose2.allValidBoxes.size());
+                            }
+                        }
+                    }
+                }
                 if (dualFrames >= 30) {
                     Log.d(TAG, String.format(
                             "[dual] 主路infer=%.1fms 第二路infer=%.1fms 并发总=%.1fms 第二路检出=%s",
@@ -798,6 +904,55 @@ public class PoseEstimator {
                 }
             } catch (Exception e) {
                 Log.w(TAG, "[2nd] 收集失败", e);
+            }
+        }
+
+        // ===== 抗准心误识别（实验选项·默认关）：命中3条则 conf × 0.35 软惩罚 =====
+        if (ANTI_CROSSHAIR_ENABLED && pose != null && pose.box != null && originalWidth > 0 && originalHeight > 0) {
+            float px = pose.box[0];
+            float py = pose.box[1];
+            float pw = pose.box[2];
+            float ph = pose.box[3];
+            if (pw > 1e-3f) {
+                // 3条同时命中才惩罚：
+                // (1) 距屏幕几何中心 < 1.2% 对角线
+                float cxC = originalWidth * 0.5f;
+                float cyC = originalHeight * 0.5f;
+                float ddx = px - cxC, ddy = py - cyC;
+                float diag = (originalWidth + originalHeight) * 0.5f;
+                boolean nearCenter = (ddx * ddx + ddy * ddy) <= (AC_DIST_RATIO * diag) * (AC_DIST_RATIO * diag);
+                if (nearCenter) {
+                    // (2) 高宽比不在真人范围（人 h/w ≈ 1.7~3.5；准心/瞄具通常 0.8~1.5 或 > 3.6 细长瞄杆）
+                    float hw = ph / pw;
+                    boolean badRatio = hw < AC_HW_MIN || hw > AC_HW_MAX;
+                    if (badRatio) {
+                        // (3) 超小尺寸：宽 < 2.2% 屏幕宽 且 高 < 2.8% 屏幕高
+                        boolean tiny = (pw < originalWidth * AC_W_RATIO_MAX) && (ph < originalHeight * AC_H_RATIO_MAX);
+                        if (tiny) {
+                            float oldConf = pose.box.length >= 5 ? pose.box[4] : CONFIDENCE_THRESHOLD;
+                            float newConf = oldConf * AC_PENALTY;
+                            if (pose.box.length >= 5) {
+                                pose.box[4] = newConf;
+                            } else {
+                                float[] nb = new float[5];
+                                System.arraycopy(pose.box, 0, nb, 0, 4);
+                                nb[4] = newConf;
+                                pose.box = nb;
+                            }
+                            if (!antiCrosshairWarned) {
+                                antiCrosshairWarned = true;
+                                String why = " dist%=" + fmt4((float) Math.sqrt(ddx * ddx + ddy * ddy) / diag)
+                                        + " h/w=" + fmt4(hw)
+                                        + " w%=" + fmt4(pw / originalWidth)
+                                        + " h%=" + fmt4(ph / originalHeight);
+                                Log.i(TAG, "[anti_crosshair] 命中准心惩罚: 候选("
+                                        + (int) px + "," + (int) py + "," + (int) pw + "," + (int) ph
+                                        + ") conf=" + fmt4(oldConf) + "→" + fmt4(newConf)
+                                        + " 原因=" + why);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -907,48 +1062,133 @@ public class PoseEstimator {
         pixelCopyBuffer.rewind();
         pixelCopyBuffer.get(pixelBytes, 0, byteLen);
 
-        // ===== 动态亮度增益：抽样算平均亮度 → EMA → mult → 超阈值重建 LUT（每帧主路只算一次）=====
+        // ===== 动态亮度增益：根据 BRIGHT_AUTO_ENABLED 开关选路径 =====
+        //   开：抽样直方图 → P90 场景亮度(EMA) → mult → 暗部抬升 → 超阈值重建 LUT
+        //   关：固定 mult=1.0、shadowLift=0，直接使用 USER_* 基础增益/偏移，不做任何环境光计算
         if (!dynBrightComputed) {
-            long sumL = 0;
-            int sampleCount = 0;
-            int rowStep = 8;  // 每 8 行抽 1 行，每 8 列抽 1 列 = 抽样率 1/64，
-            int colStep = 8;  //   对应 EMA 收敛速度仍远快于画面整体亮度变化，同时比原 1/16 省 3/4 的整数乘加
-            int w4 = width * 4;
-            for (int y = 0; y < height; y += rowStep) {
-                int rowOff = y * w4;
-                for (int x = 0; x < width; x += colStep) {
-                    int idx = rowOff + x * 4;
-                    int r = pixelBytes[idx] & 0xFF;
-                    int g = pixelBytes[idx + 1] & 0xFF;
-                    int b = pixelBytes[idx + 2] & 0xFF;
-                    // 标准 CCIR 601 luma = 0.299R + 0.587G + 0.114B（用整数乘避免浮点）
-                    sumL += (299 * r + 587 * g + 114 * b) / 1000;
-                    sampleCount++;
+            if (!BRIGHT_AUTO_ENABLED) {
+                // 关闭环境光优化：只使用用户固定设置，保证 mult=1 且不抬升暗部
+                CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN;
+                CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET;
+                CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
+                emaP90 = -1f;
+                shadowLift = 0f;
+                shadowLiftLogged = false;
+                // 变化过小不重建（首次 lastRebuild*=-1 会进入一次）
+                boolean gainChanged = (lastRebuildGain < 0f)
+                        || (Math.abs(lastRebuildGain) < 1e-4f
+                            ? Math.abs(CUR_BRIGHT_GAIN - lastRebuildGain) > REBUILD_GAIN_RATIO * 0.5f
+                            : Math.abs(CUR_BRIGHT_GAIN / lastRebuildGain - 1f) > REBUILD_GAIN_RATIO);
+                boolean offsetChanged = Math.abs(CUR_BRIGHT_OFFSET - lastRebuildOffset) > REBUILD_OFFSET_ABS;
+                boolean shadowChanged = Math.abs(shadowLift - lastRebuildShadow) > SHADOW_REBUILD_ABS;
+                if (gainChanged || (lastRebuildOffset < 0f) || offsetChanged || shadowChanged) {
+                    rebuildBrightLut();
+                    lastRebuildGain = CUR_BRIGHT_GAIN;
+                    lastRebuildOffset = CUR_BRIGHT_OFFSET;
+                    lastRebuildShadow = shadowLift;
                 }
-            }
-            int avgL = sampleCount > 0 ? (int) (sumL / sampleCount) : 128;
-            // EMA 平滑，防止帧间小抖动导致 GAIN 跳变
-            if (emaAvgL < 0f) emaAvgL = avgL;
-            else emaAvgL = emaAvgL + LUM_EMA_ALPHA * (avgL - emaAvgL);
-            // 补偿倍率：想把平均亮度拉到 TARGET_AVG_LUMA，暗画面 mult > 1，亮画面 mult < 1
-            float mult = TARGET_AVG_LUMA / (emaAvgL + 8f);
-            if (mult < MIN_MULT) mult = MIN_MULT;
-            else if (mult > MAX_MULT) mult = MAX_MULT;
-            CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN * mult;
-            CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET * mult;
-            CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
-            // 变化过小不重建（256次浮点虽快，但没必要每帧做）
-            // lastRebuildGain < 0 表示首次（必重建）；增益接近 0 时改用绝对差避免除零
-            boolean gainChanged = (lastRebuildGain < 0f)
-                    || (Math.abs(lastRebuildGain) < 1e-4f
-                        ? Math.abs(CUR_BRIGHT_GAIN - lastRebuildGain) > REBUILD_GAIN_RATIO * 0.5f
-                        : Math.abs(CUR_BRIGHT_GAIN / lastRebuildGain - 1f) > REBUILD_GAIN_RATIO);
-            boolean offsetChanged = Math.abs(CUR_BRIGHT_OFFSET - lastRebuildOffset) > REBUILD_OFFSET_ABS;
-            boolean needRebuild = gainChanged || (lastRebuildOffset < 0f) || offsetChanged;
-            if (needRebuild) {
-                rebuildBrightLut();
-                lastRebuildGain = CUR_BRIGHT_GAIN;
-                lastRebuildOffset = CUR_BRIGHT_OFFSET;
+            } else {
+                // ===== 方案B：P90 高分位替代平均亮度（亮环境+黑物体时 P90 仍高 → 不提亮，真暗环境 P90 低 → 提亮）；
+                // 再用 EVdiff（亮部12%均值 − 暗部12%均值）检测高对比场景，触发暗部抬升曲线看清黑物体。
+                int[] hist = new int[LUM_HIST_BINS];  // 32 桶亮度直方图（每桶 8 级）
+                int sampleCount = 0;
+                int rowStep = 8;  // 每 8 行抽 1 行，每 8 列抽 1 列 = 抽样率 1/64，
+                int colStep = 8;  //   对应 EMA 收敛速度仍远快于画面整体亮度变化，同时比原 1/16 省 3/4 的整数乘加
+                int w4 = width * 4;
+                for (int y = 0; y < height; y += rowStep) {
+                    int rowOff = y * w4;
+                    for (int x = 0; x < width; x += colStep) {
+                        int idx = rowOff + x * 4;
+                        int r = pixelBytes[idx] & 0xFF;
+                        int g = pixelBytes[idx + 1] & 0xFF;
+                        int b = pixelBytes[idx + 2] & 0xFF;
+                        // 标准 CCIR 601 luma = 0.299R + 0.587G + 0.114B（用整数乘避免浮点）
+                        int l = (299 * r + 587 * g + 114 * b) / 1000;
+                        hist[l >> 3]++;  // 0~255 → 32 桶
+                        sampleCount++;
+                    }
+                }
+                if (sampleCount > 0) {
+                    // P90：从高到低累计到 90% 样本 → 场景真实亮度（黑物体占 <90% 时不影响）
+                    int acc = 0;
+                    int p90 = 128;
+                    int p90Target = (int) (sampleCount * 0.9f);
+                    for (int b = LUM_HIST_BINS - 1; b >= 0; b--) {
+                        acc += hist[b];
+                        if (acc >= p90Target) { p90 = b * 8 + 4; break; }  // 取桶中值
+                    }
+                    // 亮部 12% 与暗部 12% 的加权平均 → EVdiff 对比度标尺
+                    long brightSum = 0;
+                    int brightCnt = 0;
+                    long darkSum = 0;
+                    int darkCnt = 0;
+                    int tailTarget = Math.max(1, (int) (sampleCount * 0.12f));
+                    acc = 0;
+                    for (int b = LUM_HIST_BINS - 1; b >= 0; b--) {
+                        int cnt = hist[b];
+                        if (cnt <= 0) continue;
+                        int take = Math.min(cnt, tailTarget - acc);
+                        brightSum += (long) (b * 8 + 4) * take;
+                        brightCnt += take;
+                        acc += take;
+                        if (acc >= tailTarget) break;
+                    }
+                    acc = 0;
+                    for (int b = 0; b < LUM_HIST_BINS; b++) {
+                        int cnt = hist[b];
+                        if (cnt <= 0) continue;
+                        int take = Math.min(cnt, tailTarget - acc);
+                        darkSum += (long) (b * 8 + 4) * take;
+                        darkCnt += take;
+                        acc += take;
+                        if (acc >= tailTarget) break;
+                    }
+                    int brightAvg = brightCnt > 0 ? (int) (brightSum / brightCnt) : 128;
+                    int darkAvg = darkCnt > 0 ? (int) (darkSum / darkCnt) : 0;
+                    int evDiff = brightAvg - darkAvg;
+
+                    // P90 场景亮度 EMA 平滑，防止帧间小抖动导致 GAIN 跳变
+                    if (emaP90 < 0f) emaP90 = p90;
+                    else emaP90 = emaP90 + LUM_EMA_ALPHA * (p90 - emaP90);
+                    // 补偿倍率：想把 P90 拉到 TARGET_P90_LUMA，暗画面 mult > 1，亮画面 mult < 1
+                    float mult = TARGET_P90_LUMA / (emaP90 + 8f);
+                    if (mult < MIN_MULT) mult = MIN_MULT;
+                    else if (mult > MAX_MULT) mult = MAX_MULT;
+                    CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN * mult;
+                    CUR_BRIGHT_OFFSET = USER_BRIGHT_OFFSET * mult;
+                    CUR_BRIGHT_OFFSET_NORM = CUR_BRIGHT_OFFSET * INV_255;
+
+                    // 暗部抬升强度：场景亮(P90 高)且对比度大(亮背景+黑物体)时，按 EVdiff 超限比例线性增强
+                    float targetShadow = 0f;
+                    if (emaP90 >= SHADOW_LIFT_BRIGHT_MIN && evDiff >= SHADOW_LIFT_EVDIFF_MIN) {
+                        float over = (evDiff - SHADOW_LIFT_EVDIFF_MIN) / 120f;  // EVdiff 每超 120 满格
+                        if (over > 1f) over = 1f;
+                        targetShadow = SHADOW_LIFT_MAX * over;
+                    }
+                    shadowLift = shadowLift + SHADOW_LIFT_EMA_ALPHA * (targetShadow - shadowLift);
+                    if (shadowLift < 0.01f) shadowLift = 0f;  // 小值归零，避免微弱抬升常驻
+                    if (shadowLift > 0f && !shadowLiftLogged) {
+                        shadowLiftLogged = true;
+                        Log.i(TAG, "暗部抬升激活: P90=" + (int) emaP90
+                                + " brightAvg=" + brightAvg + " darkAvg=" + darkAvg
+                                + " EVdiff=" + evDiff + " lift=" + shadowLift);
+                    }
+                }
+                // 变化过小不重建（256次浮点虽快，但没必要每帧做）
+                // lastRebuild* < 0 表示首次（必重建）；增益接近 0 时改用绝对差避免除零
+                boolean gainChanged = (lastRebuildGain < 0f)
+                        || (Math.abs(lastRebuildGain) < 1e-4f
+                            ? Math.abs(CUR_BRIGHT_GAIN - lastRebuildGain) > REBUILD_GAIN_RATIO * 0.5f
+                            : Math.abs(CUR_BRIGHT_GAIN / lastRebuildGain - 1f) > REBUILD_GAIN_RATIO);
+                boolean offsetChanged = Math.abs(CUR_BRIGHT_OFFSET - lastRebuildOffset) > REBUILD_OFFSET_ABS;
+                boolean shadowChanged = Math.abs(shadowLift - lastRebuildShadow) > SHADOW_REBUILD_ABS;
+                boolean needRebuild = gainChanged || (lastRebuildOffset < 0f) || offsetChanged || shadowChanged;
+                if (needRebuild) {
+                    rebuildBrightLut();
+                    lastRebuildGain = CUR_BRIGHT_GAIN;
+                    lastRebuildOffset = CUR_BRIGHT_OFFSET;
+                    lastRebuildShadow = shadowLift;
+                }
             }
             dynBrightComputed = true;
         }
@@ -1063,12 +1303,14 @@ public class PoseEstimator {
     /**
      * 第二路精简解析：遍历 anchors，选 conf>=VALID 的最高分（距离中心+置信度），
      * box 反变换到原图像素坐标。不做跟踪/OCM/C-BIoU（那是主路职责）。
-     * 返回 PersonPose.box=[px,py,pw,ph,conf]，仅用于 PoC1 日志检出对比。
+     * 返回 PersonPose.box=[px,py,pw,ph,conf]，同时 allValidBoxes 保存所有 VALID 检测（交叉核验用）。
      */
     private PersonPose parseOutput2() {
         int numPredictions = numAnchors;
         PersonPose best = null;
         float maxScore = -1f;
+        java.util.ArrayList<float[]> all = new java.util.ArrayList<>(8);
+        final int VALID = (int) (VALID_DETECTION_CONF * 1000000);
         for (int i = 0; i < numPredictions; i++) {
             // OPT和非OPT的conf通道输出模式一致（均含sigmoid），统一取ch4+的max
             float boxConf = 0;
@@ -1076,7 +1318,7 @@ public class PoseEstimator {
                 float conf = getOutputValue2(c, i);
                 if (conf > boxConf) boxConf = conf;
             }
-            if (boxConf < VALID_DETECTION_CONF) continue;
+            if ((int) (boxConf * 1000000) < VALID) continue;
             float cx, cy, w, h;
             if (boxIsXyxy) {
                 // OPT 模型：box 为 cxcywh 像素值 → ÷inputSize 归一化
@@ -1098,6 +1340,7 @@ public class PoseEstimator {
             float py = cy * zoomSize + zoomY;
             float pw = w * zoomSize;
             float ph = h * zoomSize;
+            all.add(new float[]{px, py, pw, ph, boxConf});
             float dx = (px - originalWidth / 2f) / originalWidth;
             float dy = (py - originalHeight / 2f) / originalHeight;
             float distToCenter = (float) Math.sqrt(dx * dx + dy * dy);
@@ -1110,19 +1353,26 @@ public class PoseEstimator {
                 best.box = new float[]{px, py, pw, ph, boxConf};
             }
         }
+        if (best != null) best.allValidBoxes = all;
         return best;
     }
 
-    /** 重建亮度查表（GAIN/OFFSET 变化时调用）：brightLut[v]=clamp(v*INV_255*CUR_GAIN+CUR_OFFSET_NORM) */
+    /** 重建亮度查表（GAIN/OFFSET/暗部抬升 变化时调用）：线性增益 + 可选暗部抬升分段曲线 */
     private void rebuildBrightLut() {
         if (brightLut == null || brightLut.length != 256) {
             brightLut = new float[256];
         }
         float curGain = CUR_BRIGHT_GAIN;
         float curOffNorm = CUR_BRIGHT_OFFSET_NORM;
+        float lift = shadowLift;
+        float invCut = lift > 0f ? 1f / SHADOW_LIFT_CUTOFF : 0f;
         for (int i = 0; i < 256; i++) {
-            float v = i * INV_255;
-            v = v * curGain + curOffNorm;
+            float w = i * INV_255;                       // 输入亮度 0~1
+            float v = w * curGain + curOffNorm;          // 线性增益 + 偏移
+            if (lift > 0f && w < SHADOW_LIFT_CUTOFF) {
+                // 暗部抬升：w=0 抬 lift，随 w 线性衰减到 cutoff 处为 0（亮部完全不动）
+                v += lift * (1f - w * invCut);
+            }
             if (v < 0f) v = 0f;
             else if (v > 1f) v = 1f;
             brightLut[i] = v;
@@ -1266,9 +1516,18 @@ public class PoseEstimator {
 
         // ===== C-BIoU 第一阶段：高置信度（conf >= HIGH=VALID_DETECTION_CONF）正常评分 =====
         PersonPose bestPose = null;
-        float maxScore = -1f;
         float bestConf = 0f;
         boolean bestMatchedTrack = false;
+        float topConf = 0f;   // 本帧模型输出最高 conf（诊断用：判断漏检 vs 逻辑吞掉）
+        // 两路选主：匹配锁定目标的框按「匹配度 simTrack」竞争（连续性优先，绿框不横跳）；
+        // 不匹配的高分新框按 score（conf×位置权重）竞争。锁定存在时匹配框永远优先，
+        // 只有当锁定目标完全消失时才由高分新框接管（走切换滞后）。
+        PersonPose bestMatchedPose = null;
+        float bestMatchSim = -1f;
+        float bestMatchedConf = 0f;
+        PersonPose bestUnmatchedPose = null;
+        float bestUnmatchedScore = -1f;
+        float bestUnmatchedConf = 0f;
 
         for (int i = 0; i < numPredictions; i++) {
             // OPT和非OPT的conf通道输出模式一致（均含sigmoid），统一取ch4+的max
@@ -1279,6 +1538,7 @@ public class PoseEstimator {
                     boxConf = conf;
                 }
             }
+            if (boxConf > topConf) topConf = boxConf;  // 记录模型本帧最强输出
             // ByteTrack: 第一阶段阈值用 HIGH；低于 HIGH 但 >= LOW 暂存为候选项
             if (boxConf < BYTETRACK_LOW_CONF) {
                 continue;
@@ -1333,32 +1593,39 @@ public class PoseEstimator {
 
                 float dx = (px - originalWidth / 2f) / originalWidth;
                 float dy = (py - originalHeight / 2f) / originalHeight;
-                float distToCenter = (float) Math.sqrt(dx * dx + dy * dy);
-                float distWeight = (float) Math.exp(-(distToCenter * distToCenter)
-                        / (2 * CENTER_SIGMA * CENTER_SIGMA));
 
-                // 方案3：水平偏心角度分数（Best Target Selection, Nicholas Gorski）
-                // FPS 横向瞄准是关键，垂直偏心不惩罚（敌人可能在上下半部分）
-                float angleWeight = (float) Math.exp(-(dx * dx)
-                        / (2 * ANGLE_SIGMA * ANGLE_SIGMA));
-                // 组合：score = (1-W)*dist + W*angle，距离为主角度为辅
-                float posWeight = (1f - SCORE_W) * distWeight + SCORE_W * angleWeight;
-
-                // C-BIoU：跟踪加分用预测后的 trackedBox 做 buffered IoU（HIGH 阶段，速度自适应 buffer）
-                float trackBonus = 1.0f;
+                // C-BIoU：跟踪匹配用预测后的 trackedBox 做 buffered IoU（HIGH 阶段，速度自适应 buffer）
                 boolean matched = predTracked != null
                         && simTrack(predTracked, box, dynHighBuffer) >= TRACK_IOU_THRESHOLD;
                 if (matched) {
-                    trackBonus = TRACK_BONUS;
-                }
-
-                float score = boxConf * posWeight * trackBonus;
-                if (score > maxScore) {
-                    maxScore = score;
-                    bestConf = boxConf;
-                    bestPose = new PersonPose();
-                    bestPose.box = box;
-                    bestMatchedTrack = matched;
+                    // 匹配锁定目标：按匹配度 simTrack 竞争（连续性优先）。
+                    // 两个目标都匹配锁定框时不再按 conf/位置 score 竞争，避免绿框在目标间帧级横跳；
+                    // trackedBox 会更新到选中框，下一帧该框匹配度最高，形成自稳定。
+                    float matchSim = simTrack(predTracked, box, dynHighBuffer);
+                    if (matchSim > bestMatchSim) {
+                        bestMatchSim = matchSim;
+                        bestMatchedConf = boxConf;
+                        bestMatchedPose = new PersonPose();
+                        bestMatchedPose.box = box;
+                    }
+                } else {
+                    // 不匹配的高分新框：按 conf×位置权重 score 竞争（仅锁定消失时接管）
+                    float distToCenter = (float) Math.sqrt(dx * dx + dy * dy);
+                    float distWeight = (float) Math.exp(-(distToCenter * distToCenter)
+                            / (2 * CENTER_SIGMA * CENTER_SIGMA));
+                    // 方案3：水平偏心角度分数（Best Target Selection, Nicholas Gorski）
+                    // FPS 横向瞄准是关键，垂直偏心不惩罚（敌人可能在上下半部分）
+                    float angleWeight = (float) Math.exp(-(dx * dx)
+                            / (2 * ANGLE_SIGMA * ANGLE_SIGMA));
+                    // 组合：score = (1-W)*dist + W*angle，距离为主角度为辅
+                    float posWeight = (1f - SCORE_W) * distWeight + SCORE_W * angleWeight;
+                    float score = boxConf * posWeight;
+                    if (score > bestUnmatchedScore) {
+                        bestUnmatchedScore = score;
+                        bestUnmatchedConf = boxConf;
+                        bestUnmatchedPose = new PersonPose();
+                        bestUnmatchedPose.box = box;
+                    }
                 }
             } else {
                 // === LOW 分支（BYTETRACK_LOW_CONF <= conf < VALID_DETECTION_CONF）
@@ -1373,6 +1640,17 @@ public class PoseEstimator {
                 }
                 lowBoxes[lowCount++] = new float[]{px, py, pw, ph, boxConf};
             }
+        }
+
+        // ===== 选主：锁定目标的匹配框永远优先（连续性），无匹配框才用高分新框 =====
+        if (bestMatchedPose != null) {
+            bestPose = bestMatchedPose;
+            bestConf = bestMatchedConf;
+            bestMatchedTrack = true;
+        } else if (bestUnmatchedPose != null) {
+            bestPose = bestUnmatchedPose;
+            bestConf = bestUnmatchedConf;
+            bestMatchedTrack = false;
         }
 
         // ===== HIGH 检测框 NMS 去重（方案 A）=====
@@ -1477,44 +1755,38 @@ public class PoseEstimator {
             }
         }
 
-        // HIGH 阶段若已选到"非跟踪目标"的高分框（例如画面里另一个人），
-        // 但当前仍在锁定中，我们不应该轻易抢走锁定，否则两个清晰目标间会反复横跳。
-        // 方案：切换滞后——新目标需连续 SWITCH_CONFIRM_FRAMES 帧保持最优才接管。
-        //   置信度 < TAKEOVER_CONF 直接拒绝（保持旧目标）；置信度足够则进入候选确认，
-        //   连续多帧领先才切换，单帧评分波动不会触发横跳。
-        if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack
-                && bestPose != null && !rescuedByLow) {
-            if (bestConf < TAKEOVER_CONF) {
-                // 置信度不足，拒绝接管
+        // ===== 锁定保持（track-and-hold）：已锁定且本帧无匹配框时，绝不切换到其他目标。=====
+        // 分两段处理，显示层与锁定层解耦：
+        //   [0, LOCK_HOLD_FRAMES) 短暂漏检 → 补位显示旧目标（绿框保持，防闪烁）
+        //   [LOCK_HOLD_FRAMES, MAX_TRACK_LOST) 持续丢失 → 绿框淡出（bestPose=null），
+        //       但仍锁 A，强制丢弃 unmatched 新框 B，禁止 B 抢锁 → 杜绝 A/B 横跳
+        // 只有当 trackLostFrames 达到 MAX_TRACK_LOST（A 彻底消失）才释放锁定，B 才能接管。
+        boolean heldByLock = false;   // 本帧是否由锁定保持补位（非真实检测）
+        boolean coastPose = false;    // 锁定保持补位是否用了速度外推
+        if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack) {
+            if (trackLostFrames < LOCK_HOLD_FRAMES) {
+                // 短暂漏检：补位显示旧目标（绿框保持，防闪烁）
+                float[] holdBox = trackedBox;
+                float speedSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
+                if (speedSq >= COAST_MIN_VEL * COAST_MIN_VEL && trackLostFrames <= COAST_MAX_FRAMES) {
+                    float steps = Math.min(trackLostFrames + 1, COAST_MAX_FRAMES);
+                    holdBox = new float[] {
+                            trackedBox[0] + lastRawVx * steps,
+                            trackedBox[1] + lastRawVy * steps,
+                            trackedBox[2],
+                            trackedBox[3]
+                    };
+                    coastPose = true;
+                }
+                bestPose = new PersonPose();
+                bestPose.box = holdBox.clone();
+                bestConf = 0f;
+                heldByLock = true;
+            } else {
+                // 持续丢失：绿框淡出，但仍锁 A，丢弃 unmatched 新框 B 防止抢锁
                 bestPose = null;
                 bestConf = 0f;
-                switchCandidateBox = null;
-                switchCandidateFrames = 0;
-            } else {
-                // 置信度足够，判断是否与上一帧候选是同一目标（中心距离接近）
-                boolean sameCandidate = switchCandidateBox != null
-                        && Math.abs(switchCandidateBox[0] - bestPose.box[0]) < SWITCH_SAME_DIST
-                        && Math.abs(switchCandidateBox[1] - bestPose.box[1]) < SWITCH_SAME_DIST;
-                if (sameCandidate) {
-                    switchCandidateFrames++;
-                } else {
-                    switchCandidateBox = bestPose.box.clone();
-                    switchCandidateFrames = 1;
-                }
-                if (switchCandidateFrames < SWITCH_CONFIRM_FRAMES) {
-                    // 尚未连续确认，暂不切换，保持旧目标
-                    bestPose = null;
-                    bestConf = 0f;
-                } else {
-                    // 连续多帧领先，确认切换
-                    switchCandidateBox = null;
-                    switchCandidateFrames = 0;
-                }
             }
-        } else {
-            // 当前选中的是跟踪目标（或无需保护），清空切换候选
-            switchCandidateBox = null;
-            switchCandidateFrames = 0;
         }
 
         // ===== OA-SORT OAM：计算当前 bestPose 被其他 HIGH 检测框遮挡的系数 =====
@@ -1526,7 +1798,7 @@ public class PoseEstimator {
 
         // ===== 更新速度估计 & 跟踪状态 =====
         long nowNanos = System.nanoTime();
-        if (bestPose != null) {
+        if (bestPose != null && !heldByLock) {
             // OA-SORT BAM (Bias-Aware Momentum)：
             // BAM = IoU(predTracked, Z) · (1 - Oc_prev)
             // Z' = BAM · Z + (1 - BAM) · predTracked
@@ -1645,26 +1917,6 @@ public class PoseEstimator {
             leadValid = false;
         }
 
-        // OC-SORT Coast（速度外推）：丢失期间用瞬时速度外推位置继续显示绿框，
-        // 仅在「明显移动（速度≥COAST_MIN_VEL）+ 短时丢失（lost≤COAST_MAX_FRAMES）」时外推，
-        // 解决大幅移动瞬时丢检测的闪烁；静止丢失或持续丢失直接 return null 触发淡出。
-        // 用 lastRawVx/Y（瞬时）而非 trackVelX（EMA）：EMA 变向滞后，会导致角色变向丢失时
-        // 绿框沿旧方向反向滑动；瞬时速度方向正确
-        if (bestPose == null && trackedBox != null
-                && trackLostFrames <= COAST_MAX_FRAMES) {
-            float speedSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
-            if (speedSq >= COAST_MIN_VEL * COAST_MIN_VEL) {
-                float steps = Math.min(trackLostFrames + 1, COAST_MAX_FRAMES);
-                bestPose = new PersonPose();
-                bestPose.box = new float[] {
-                        trackedBox[0] + lastRawVx * steps,
-                        trackedBox[1] + lastRawVy * steps,
-                        trackedBox[2],
-                        trackedBox[3]
-                };
-            }
-        }
-
         // 检测诊断：低频打印选中目标的置信度/高宽比/面积，用于对比「背景物体 vs 真实人物」特征
         if (bestPose != null && bestPose.box != null && ++detLogCounter % 30 == 0) {
             float ar = bestPose.box[3] / Math.max(1f, bestPose.box[2]); // 高/宽比（人物竖长 >1，箱子方形 ≈1）
@@ -1673,6 +1925,35 @@ public class PoseEstimator {
                     + " 高宽比=" + String.format(java.util.Locale.US, "%.2f", ar)
                     + " 面积norm=" + String.format(java.util.Locale.US, "%.3f", areaNorm)
                     + " 尺寸=" + (int) bestPose.box[2] + "x" + (int) bestPose.box[3] + "px");
+        }
+
+        // ===== 静态图闪烁诊断（临时）：每帧累计窗口统计，满 30 帧打一条汇总 =====
+        // topConf=模型本帧最强输出（含 LOW，过滤掉 conf<0.1 的噪声锚点前的最高值）
+        // 判断口径：
+        //   topConf 高(HIGH 附近)但 选中 少 => 检测在但被选中逻辑吞掉
+        //   topConf 低(常在 0.1~0.2 以下) => 模型对静态输入间歇漏检
+        //   补位>0  => 锁定保持（heldByLock）在起作用：锁定中本帧无匹配框，补位显示旧目标
+        diagFrame++;
+        if (topConf > diagTopMax) diagTopMax = topConf;
+        if (topConf < diagTopMin) diagTopMin = topConf;
+        diagTopSum += topConf;
+        if (highCount > 0) diagHighFrames++;
+        if (lowCount > 0) diagLowFrames++;
+        if (heldByLock) diagRejected++;
+        if (coastPose) diagCoast++;
+        if (bestPose != null && bestPose.box != null) diagSelected++;
+        if (diagFrame >= 30) {
+            Log.d(TAG, "闪烁诊断 30帧: 选中=" + diagSelected
+                    + " HIGH=" + diagHighFrames
+                    + " LOW=" + diagLowFrames
+                    + " topConf[" + fmt4(diagTopMin) + "~" + fmt4(diagTopMax)
+                    + " avg=" + fmt4((float) (diagTopSum / diagFrame)) + "]"
+                    + " 补位=" + diagRejected
+                    + " coast=" + diagCoast
+                    + " roi=(" + roiX + "," + roiY + "," + roiSize + ")"
+                    + " box=" + (bestPose != null ? (int) bestPose.box[2] + "x" + (int) bestPose.box[3] : "null"));
+            diagFrame = 0; diagSelected = 0; diagHighFrames = 0; diagLowFrames = 0;
+            diagRejected = 0; diagCoast = 0; diagTopMax = 0f; diagTopMin = 1f; diagTopSum = 0;
         }
 
         return bestPose;
@@ -1953,10 +2234,22 @@ public class PoseEstimator {
         scaleSrcRect = null;
         output = null;
         trackedBox = null;
+        firstInferLogged = false;
+        realStatsLogged = false;
+        shadowLiftLogged = false;
+        dualVerifyWarned = false;
+        antiCrosshairWarned = false;
+        BRIGHT_AUTO_ENABLED = true;
+        DUAL_INFER_ENABLED = false;
+        DUAL_VERIFY_ENABLED = false;
+        ANTI_CROSSHAIR_ENABLED = false;
         originalWidth = 0;
         originalHeight = 0;
         roiX = 0;
         roiY = 0;
         roiSize = 0;
+        // 重置静态图闪烁诊断窗口（临时字段，随实例释放）
+        diagFrame = 0; diagSelected = 0; diagHighFrames = 0; diagLowFrames = 0;
+        diagRejected = 0; diagCoast = 0; diagTopMax = 0f; diagTopMin = 1f; diagTopSum = 0;
     }
 }
