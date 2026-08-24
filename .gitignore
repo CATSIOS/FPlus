@@ -13,3 +13,14 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# 本地开发工具与模型文件（不上传 GitHub）
+# 模型导出/探测脚本
+export_tflite.py
+colab_export_tflite.py
+probe_model.py
+# 源模型文件（大文件）
+*.pt
+*.onnx
+# 图标源文件（非 app 资源，保留本地）
+FPlus_logo.png
