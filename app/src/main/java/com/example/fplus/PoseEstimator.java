@@ -64,9 +64,11 @@ public class PoseEstimator {
     private boolean BRIGHT_AUTO_ENABLED = true;  // 高级选项"启用环境光优化"，true=动态增益+暗部抬升，false=只使用 USER_* 基础值
     private float USER_BRIGHT_GAIN = 1.3f;
     private float USER_BRIGHT_OFFSET = 25f;
-    private float CUR_BRIGHT_GAIN = 1.3f;
-    private float CUR_BRIGHT_OFFSET = 25f;
-    private float CUR_BRIGHT_OFFSET_NORM;
+    // CUR_* 在主线程 bitmapToByteBuffer 里写、第二线程 bitmapToByteBuffer2 里读（brighten），
+    // 加 volatile 保证跨线程可见性，避免第二路读到过期亮度值导致两路输入不一致
+    private volatile float CUR_BRIGHT_GAIN = 1.3f;
+    private volatile float CUR_BRIGHT_OFFSET = 25f;
+    private volatile float CUR_BRIGHT_OFFSET_NORM;
     // 动态亮度配置：场景亮度用 P90 高分位（替代平均亮度，避免"亮环境+黑物体"误判为暗）、
     // EMA平滑系数、重建LUT的变化阈值、补偿倍率上下限
     private static final float TARGET_P90_LUMA = 150f;   // 期望的 P90 亮度：亮场景不提亮，暗场景提亮
@@ -158,6 +160,9 @@ public class PoseEstimator {
     private float[] inputFloats2;
     private int[] pixels2;
     private float[][][] output2;
+    // 第二路多输出模式（boxes/scores 分离）：与主路 outputBoxes/outputScores 对称，避免单 output 模式下 NPE
+    private float[][][] outputBoxes2;
+    private float[][][] outputScores2;
     private Bitmap scaledRoi2;
     private Canvas scaleCanvas2;
     private Paint scalePaint2;
@@ -337,6 +342,8 @@ public class PoseEstimator {
 
     public static class PersonPose {
         public float[] box;
+        /** 本目标的置信度（box 内可能只含 cxcywh 4 元素，conf 独立存放，供降权逻辑读取真实值） */
+        public float conf = 0f;
         /** 交叉核验用：此检测路径下的所有 valid 检测框，格式 [px,py,pw,ph,conf]（原图像素坐标） */
         public java.util.List<float[]> allValidBoxes;
     }
@@ -676,7 +683,15 @@ public class PoseEstimator {
         inputBuffer2.order(ByteOrder.nativeOrder());
         inputBuffer2.rewind();
         inputFloatBuffer2 = inputBuffer2.asFloatBuffer();
-        output2 = new float[output.length][output[0].length][output[0][0].length];
+        // 与主路对称：多输出模式下分别分配 boxes/scores 缓冲，单输出模式沿用 output2
+        if (multiOutputMode) {
+            int[] s0 = interpreter.getOutputTensor(0).shape();
+            int[] s1 = interpreter.getOutputTensor(1).shape();
+            outputBoxes2 = new float[s0[0]][s0[1]][s0[2]];
+            outputScores2 = new float[s1[0]][s1[1]][s1[2]];
+        } else {
+            output2 = new float[output.length][output[0].length][output[0][0].length];
+        }
         scaledRoi2 = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888);
         scaleCanvas2 = new Canvas(scaledRoi2);
         scalePaint2 = new Paint(Paint.FILTER_BITMAP_FLAG);
@@ -869,16 +884,9 @@ public class PoseEstimator {
                         if (!matched) {
                             // 只做降权（45% 保留），不到 0.25 会低于 HIGH 阈值，无法即时接管 lock
                             // 惩罚后在整个 track 流程里被同等对待，但接管 lock 需要 TAKEOVER_CONF=0.5 更难
-                            float oldConf = pose.box.length >= 5 ? pose.box[4] : CONFIDENCE_THRESHOLD;
+                            float oldConf = pose.conf;
                             float newConf = oldConf * 0.45f;
-                            if (pose.box.length >= 5) {
-                                pose.box[4] = newConf;
-                            } else {
-                                float[] nb = new float[5];
-                                System.arraycopy(pose.box, 0, nb, 0, 4);
-                                nb[4] = newConf;
-                                pose.box = nb;
-                            }
+                            pose.conf = newConf;
                             if (!dualVerifyWarned) {
                                 dualVerifyWarned = true;
                                 Log.i(TAG, "[dual_verify] 命中FP惩罚: 主候选("
@@ -929,16 +937,9 @@ public class PoseEstimator {
                         // (3) 超小尺寸：宽 < 2.2% 屏幕宽 且 高 < 2.8% 屏幕高
                         boolean tiny = (pw < originalWidth * AC_W_RATIO_MAX) && (ph < originalHeight * AC_H_RATIO_MAX);
                         if (tiny) {
-                            float oldConf = pose.box.length >= 5 ? pose.box[4] : CONFIDENCE_THRESHOLD;
+                            float oldConf = pose.conf;
                             float newConf = oldConf * AC_PENALTY;
-                            if (pose.box.length >= 5) {
-                                pose.box[4] = newConf;
-                            } else {
-                                float[] nb = new float[5];
-                                System.arraycopy(pose.box, 0, nb, 0, 4);
-                                nb[4] = newConf;
-                                pose.box = nb;
-                            }
+                            pose.conf = newConf;
                             if (!antiCrosshairWarned) {
                                 antiCrosshairWarned = true;
                                 String why = " dist%=" + fmt4((float) Math.sqrt(ddx * ddx + ddy * ddy) / diag)
@@ -1231,7 +1232,14 @@ public class PoseEstimator {
             Bitmap rb2 = preprocessBitmap2(source);
             bitmapToByteBuffer2(rb2);
             long ti0 = System.nanoTime();
-            interpreter2.run(inputBuffer2, output2);
+            if (multiOutputMode) {
+                java.util.Map<Integer, Object> outputs2 = new java.util.HashMap<>();
+                outputs2.put(0, outputBoxes2);
+                outputs2.put(1, outputScores2);
+                interpreter2.runForMultipleInputsOutputs(new Object[]{inputBuffer2}, outputs2);
+            } else {
+                interpreter2.run(inputBuffer2, output2);
+            }
             long ti1 = System.nanoTime();
             secondInferNanos.set(ti1 - ti0);
             return parseOutput2();
@@ -1293,6 +1301,16 @@ public class PoseEstimator {
     }
 
     private float getOutputValue2(int channel, int anchor) {
+        if (multiOutputMode) {
+            if (channel < 4) {
+                if (channelFirst) return outputBoxes2[0][channel][anchor];
+                else return outputBoxes2[0][anchor][channel];
+            } else {
+                int sc = channel - 4;
+                if (channelFirst) return outputScores2[0][sc][anchor];
+                else return outputScores2[0][anchor][sc];
+            }
+        }
         if (channelFirst) {
             return output2[0][channel][anchor];
         } else {
@@ -1888,6 +1906,18 @@ public class PoseEstimator {
                 trackLostFrames = 0;
                 trackVelX = 0f;
                 trackVelY = 0f;
+                // 目标彻底丢失：清空瞬时速度/加速度状态，防止下一个目标 B 继承 A 的残留速度
+                // 导致加速度误判（accX=lastRawVx-prevRawVx 出现跳变）→ 误触发 CA 外推 → 小目标匹配失败
+                lastRawVx = 0f;
+                lastRawVy = 0f;
+                prevRawVx = 0f;
+                prevRawVy = 0f;
+                // 自适应外推提前量/残差 EMA 也复位，避免 A 学到的外推量延续到 B
+                adaptiveLeadSec = PREDICT_SECONDS;
+                leadErrEma = 0f;
+                lastLeadDx = 0f;
+                lastLeadDy = 0f;
+                leadValid = false;
                 lastTrackTimeNanos = 0L;
                 lastBestOcclusion = 0f;
             }
@@ -1956,6 +1986,9 @@ public class PoseEstimator {
             diagRejected = 0; diagCoast = 0; diagTopMax = 0f; diagTopMin = 1f; diagTopSum = 0;
         }
 
+        // 把选中的置信度写入 PersonPose.conf，供上层降权逻辑（dual_verify/anti_crosshair）读取真实值，
+        // 否则 box 只含 cxcywh 4 元素，读不到 conf（此前误读 box[4] 恒失败）
+        if (bestPose != null) bestPose.conf = bestConf;
         return bestPose;
     }
 
@@ -2210,6 +2243,8 @@ public class PoseEstimator {
         inputFloats2 = null;
         pixels2 = null;
         output2 = null;
+        outputBoxes2 = null;
+        outputScores2 = null;
 
         if (interpreter != null) {
             interpreter.close();
