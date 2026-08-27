@@ -1398,12 +1398,18 @@ public class PoseEstimator {
     }
 
     private float brighten(float v) {
-        v = v * CUR_BRIGHT_GAIN + CUR_BRIGHT_OFFSET_NORM;
+        float out = v * CUR_BRIGHT_GAIN + CUR_BRIGHT_OFFSET_NORM;
+        // 与主路 brightLut 保持一致：暗部抬升（亮环境+黑物体时抬阴影），
+        // 否则第二路输入与主路不一致，影响双路交叉核验
+        float lift = shadowLift;
+        if (lift > 0f && v < SHADOW_LIFT_CUTOFF) {
+            out += lift * (1f - v / SHADOW_LIFT_CUTOFF);
+        }
         // clamp 到 [0,1]：用户在高级选项可能输入负 BRIGHTNESS_OFFSET，
         // 不 clamp 下界会让模型输入出现负值，产生异常输出
-        if (v < 0f) return 0f;
-        if (v > 1f) return 1f;
-        return v;
+        if (out < 0f) return 0f;
+        if (out > 1f) return 1f;
+        return out;
     }
 
     private float getOutputValue(int channel, int anchor) {
@@ -1782,7 +1788,27 @@ public class PoseEstimator {
         boolean heldByLock = false;   // 本帧是否由锁定保持补位（非真实检测）
         boolean coastPose = false;    // 锁定保持补位是否用了速度外推
         if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack) {
-            if (trackLostFrames < LOCK_HOLD_FRAMES) {
+            // 接管阈值：新目标置信度 ≥ TAKEOVER_CONF 时绕过锁定保持，立即切换锁定
+            // （解决「人物突然入场」被压制 MAX_TRACK_LOST 帧的延迟；远处小目标 conf 通常 < 0.5 仍受保护）
+            boolean takeover = bestPose != null && bestConf >= TAKEOVER_CONF;
+            if (takeover) {
+                // 高分新目标即时接管：释放旧锁（trackedBox=null），让后续通用路径按「首次锁定」处理 B；
+                // 否则 BAM 混合块会用旧目标 A 的 predTracked 外推位置污染 B（A/B 相距远时 bam≈0 → trackedBox 退回 A）。
+                trackedBox = null;
+                trackLostFrames = 0;
+                trackVelX = 0f;
+                trackVelY = 0f;
+                lastRawVx = 0f;
+                lastRawVy = 0f;
+                prevRawVx = 0f;
+                prevRawVy = 0f;
+                lastTrackTimeNanos = 0L;
+                adaptiveLeadSec = PREDICT_SECONDS;
+                leadErrEma = 0f;
+                lastLeadDx = 0f;
+                lastLeadDy = 0f;
+                leadValid = false;
+            } else if (trackLostFrames < LOCK_HOLD_FRAMES) {
                 // 短暂漏检：补位显示旧目标（绿框保持，防闪烁）
                 float[] holdBox = trackedBox;
                 float speedSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
@@ -1928,7 +1954,8 @@ public class PoseEstimator {
         // 静止目标（速度低于 MIN_VEL）不外推，避免静止时绿框漂移（方案 B）
         // 注意：bestPose.box 是独立 new 出来的引用，trackedBox 已 clone，互不影响
         // trackVelX 单位：60fps 基准每帧位移，× 60 转换为"每秒位移"再 × adaptiveLeadSec
-        if (bestPose != null && trackedBox != null) {
+        // 补位帧（heldByLock）已由 coast 外推过（或原地补位），跳过预测外推避免双重叠加冲过头
+        if (bestPose != null && trackedBox != null && !heldByLock) {
             float speedSq = trackVelX * trackVelX + trackVelY * trackVelY;
             if (speedSq >= MIN_VEL * MIN_VEL) {
                 float predDx = trackVelX * 60f * adaptiveLeadSec;

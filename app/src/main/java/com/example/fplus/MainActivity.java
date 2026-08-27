@@ -26,10 +26,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE_OVERLAY_PERMISSION = 2001;
     private static final int REQUEST_CODE_CAPTURE = 2002;
 
-    private static final String MODEL_DEFAULT = "sunxds_0.8.0.tflite";
-    private static final String MODEL_416 = "sunxds_0.8.0_416.tflite";
     private static final String MODEL_320_OPT = "sunxds_0.8.0_320_opt.tflite";
-    private static final String MODEL_416_OPT = "sunxds_0.8.0_416_opt.tflite";
+    private static final String MODEL_DELTA = "deltaforce_640.tflite";
 
     private SharedPreferences prefs;
     private RadioGroup radioModel;
@@ -55,7 +53,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Adapter 构造时已预加载 child view，直接取引用（不会 NPE）
         radioModel = settingsAdapter.getModelRadioGroup();
-        String savedModel = prefs.getString("model_name", MODEL_DEFAULT);
+        String savedModel = prefs.getString("model_name", MODEL_DELTA);
         radioModel.check(checkedIdForModel(savedModel));
         radioModel.setOnCheckedChangeListener((group, checkedId) ->
                 prefs.edit().putString("model_name", modelForCheckedId(checkedId)).apply());
@@ -185,8 +183,8 @@ public class MainActivity extends AppCompatActivity {
             Bitmap testBitmap = Bitmap.createBitmap(720, 450, Bitmap.Config.ARGB_8888);
             testBitmap.eraseColor(0xFF808080);
 
-            // 测 640/416/320opt/416opt（NHWC/INT8 实测更慢，已证伪，不再参与测速）
-            String[] models = {MODEL_DEFAULT, MODEL_416, MODEL_320_OPT, MODEL_416_OPT};
+            // 测 DeltaForce 640 / 320opt（NHWC/INT8 实测更慢，已证伪，不再参与测速）
+            String[] models = {MODEL_DELTA, MODEL_320_OPT};
             // 测速只测 NPU / GPU，CPU 永远最慢，跳过以大幅缩短测速时间
             PoseEstimator.Backend[] backends = {
                     PoseEstimator.Backend.NNAPI,
@@ -277,10 +275,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String modelLabel(String model) {
-        if (MODEL_416.equals(model)) return "416";
-        if (MODEL_320_OPT.equals(model)) return "320/OPT(原生训练)";
-        if (MODEL_416_OPT.equals(model)) return "416/OPT(简化)";
-        return "640/NCHW";
+        if (MODEL_DELTA.equals(model)) return "DeltaForce/640";
+        return "320/OPT(原生训练)";
     }
 
     private String backendLabel(PoseEstimator.Backend backend) {
@@ -311,17 +307,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private int checkedIdForModel(String model) {
-        if (MODEL_416.equals(model)) return R.id.radio_model_416;
-        if (MODEL_320_OPT.equals(model)) return R.id.radio_model_320_opt;
-        if (MODEL_416_OPT.equals(model)) return R.id.radio_model_416_opt;
-        return R.id.radio_model_default;
+        if (MODEL_DELTA.equals(model)) return R.id.radio_model_delta;
+        return R.id.radio_model_320_opt;
     }
 
     private String modelForCheckedId(int checkedId) {
-        if (checkedId == R.id.radio_model_416) return MODEL_416;
-        if (checkedId == R.id.radio_model_320_opt) return MODEL_320_OPT;
-        if (checkedId == R.id.radio_model_416_opt) return MODEL_416_OPT;
-        return MODEL_DEFAULT;
+        if (checkedId == R.id.radio_model_delta) return MODEL_DELTA;
+        return MODEL_320_OPT;
     }
 
     private static class BenchResult {

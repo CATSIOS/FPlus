@@ -1,7 +1,20 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 全局方角 ShapeAppearance：cornerSize=0（按钮使用 shapeAppearanceCornerFull 全圆角，不受影响） -->
+    <style name="ShapeAppearance.FPlus.NoCorner" parent="ShapeAppearance.Material3.Corner.Small">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">0dp</item>
+    </style>
+
     <!-- Base application theme. -->
     <style name="Base.Theme.FPlus" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/accent</item>
+
+        <!-- 除按钮外所有组件 0 圆角（侧导航栏 / 输入框 / 卡片等） -->
+        <item name="shapeAppearanceCornerExtraSmall">@style/ShapeAppearance.FPlus.NoCorner</item>
+        <item name="shapeAppearanceCornerSmall">@style/ShapeAppearance.FPlus.NoCorner</item>
+        <item name="shapeAppearanceCornerMedium">@style/ShapeAppearance.FPlus.NoCorner</item>
+        <item name="shapeAppearanceCornerLarge">@style/ShapeAppearance.FPlus.NoCorner</item>
+        <item name="shapeAppearanceCornerExtraLarge">@style/ShapeAppearance.FPlus.NoCorner</item>
     </style>
 
     <style name="Theme.FPlus" parent="Base.Theme.FPlus" />

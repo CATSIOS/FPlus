@@ -7,10 +7,8 @@
     <string name="backend_gpu">GPU 推理</string>
     <string name="backend_cpu">CPU 推理</string>
     <string name="model_option_title">模型</string>
-    <string name="model_default">Input 640 NCHW</string>
-    <string name="model_416">Input 416 NCHW</string>
     <string name="model_320_opt">Input 320 NHWC OPT</string>
-    <string name="model_416_opt">Input 416 NHWC OPT</string>
+    <string name="model_delta">DeltaForce 640</string>
     <string name="btn_start">开始</string>
     <string name="btn_stop">停止</string>
     <string name="btn_benchmark">自动测速</string>

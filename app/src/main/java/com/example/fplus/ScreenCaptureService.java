@@ -115,7 +115,7 @@ public class ScreenCaptureService extends Service {
         } catch (IllegalArgumentException e) {
             backend = PoseEstimator.Backend.CPU;
         }
-        String modelName = prefs.getString("model_name", "sunxds_0.8.0.tflite");
+        String modelName = prefs.getString("model_name", "deltaforce_640.tflite");
         try {
             poseEstimator = new PoseEstimator(this, modelName, backend);
         } catch (Exception e) {

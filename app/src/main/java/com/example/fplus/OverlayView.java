@@ -16,6 +16,10 @@ public class OverlayView extends View {
 
     // 当前显示框（归一化：cx, cy, w, h），位置与尺寸做低通平滑，无速度预测
     private float[] displayBox;
+    // 淡出绘制框：目标丢失后 50ms 内继续绘制的旧框，与跟踪状态 displayBox 解耦。
+    // 关键：目标丢失时立即清空 displayBox（跟踪状态），B 到来时走全新落位，
+    // 避免淡出窗口内 B 被旧目标 A 的位置/速度缓存污染（导致 A/B 横跳）。
+    private float[] fadingBox;
     // 1€ 滤波器（x/y 独立）
     private OneEuroFilter filterX;
     private OneEuroFilter filterY;
@@ -119,21 +123,35 @@ public class OverlayView extends View {
         this.roiSize = roiSize;
 
         if (box == null) {
+            // 目标丢失：先把当前跟踪框转存为淡出框，再立即清空跟踪状态
             if (displayBox != null) {
+                if (fadingBox == null) fadingBox = new float[4];
+                fadingBox[0] = displayBox[0];
+                fadingBox[1] = displayBox[1];
+                fadingBox[2] = displayBox[2];
+                fadingBox[3] = displayBox[3];
+                displayBox = null;   // 关键：立即清空跟踪状态，B 到来时走全新落位，无缓存残留
+            }
+            // 目标消失：清除 1€ 滤波器缓存（xHat/dxHat/xPrev），
+            // 否则下一个目标（B）到来时 filter 会携带旧目标（A）的位置/速度惯性，
+            // 绿框从 A 平滑滑到 B（表现为横跳/滑动）。reset 后 B 首次滤波直接落到 B 位置。
+            if (filterX != null) filterX.reset();
+            if (filterY != null) filterY.reset();
+
+            // 淡出计时（基于 fadingBox，与跟踪状态无关）
+            if (fadingBox != null) {
                 if (lostAtNanos == 0) {
                     lostAtNanos = timestampNanos;
                 }
                 long elapsed = timestampNanos - lostAtNanos;
                 if (elapsed <= 0) {
-                    // 时间戳倒转/同帧：兜底保持当前透明度（不超过255）
                     if (fadeAlpha > 255) fadeAlpha = 255;
                     if (fadeAlpha < 0) fadeAlpha = 0;
                 } else if (elapsed >= FADE_DURATION_NANOS) {
-                    displayBox = null;
+                    fadingBox = null;
                     fadeAlpha = 255;
                     lostAtNanos = 0;
                 } else {
-                    // 按真实时长线性淡出：从 255 到 0，严格 clamp 防溢出
                     int alpha = 255 - (int) (255L * elapsed / FADE_DURATION_NANOS);
                     if (alpha < 0) alpha = 0;
                     if (alpha > 255) alpha = 255;
@@ -142,16 +160,13 @@ public class OverlayView extends View {
             } else {
                 lostAtNanos = 0;
             }
-            // 目标消失：清除 1€ 滤波器缓存（xHat/dxHat/xPrev），
-            // 否则下一个目标（B）到来时 filter 会携带旧目标（A）的位置/速度惯性，
-            // 绿框从 A 平滑滑到 B（表现为横跳/滑动）。reset 后 B 首次滤波直接落到 B 位置。
-            if (filterX != null) filterX.reset();
-            if (filterY != null) filterY.reset();
             // 无论绿框是否还在淡出，都要重绘：黄圈（ROI）回正需要持续刷新
             invalidate();
             return;
         }
 
+        // 有目标：清除淡出框
+        fadingBox = null;
         fadeAlpha = 255;
         lostAtNanos = 0;
 
@@ -217,11 +232,13 @@ public class OverlayView extends View {
             canvas.drawCircle(roiCx, roiCy, roiRadius, roiPaint);
         }
 
-        if (displayBox != null) {
-            float cx = displayBox[0];
-            float cy = displayBox[1];
-            float w = displayBox[2];
-            float h = displayBox[3];
+        // 优先绘制跟踪框（displayBox），无跟踪框时绘制淡出框（fadingBox）
+        float[] drawSrc = (displayBox != null) ? displayBox : fadingBox;
+        if (drawSrc != null) {
+            float cx = drawSrc[0];
+            float cy = drawSrc[1];
+            float w = drawSrc[2];
+            float h = drawSrc[3];
             float left = offsetX + (cx - w / 2) * drawWidth;
             float top = offsetY + (cy - h / 2) * drawHeight;
             float right = offsetX + (cx + w / 2) * drawWidth;
