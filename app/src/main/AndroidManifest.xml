@@ -39,6 +39,34 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- 模型选择 -->
+        <activity
+            android:name=".ModelSettingsActivity"
+            android:label="@string/model_option_title"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- 推理后端选择 -->
+        <activity
+            android:name=".BackendSettingsActivity"
+            android:label="@string/gpu_option_title"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- 模型管理（下载/删除） -->
+        <activity
+            android:name=".ModelManagerActivity"
+            android:label="@string/models_option_title"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- 自动测速 -->
+        <activity
+            android:name=".BenchmarkActivity"
+            android:label="@string/benchmark_option_title"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <!-- 屏幕捕获前台服务 -->
         <service
             android:name=".ScreenCaptureService"

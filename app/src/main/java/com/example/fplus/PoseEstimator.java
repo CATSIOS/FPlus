@@ -16,6 +16,7 @@ import org.tensorflow.lite.gpu.CompatibilityList;
 import org.tensorflow.lite.gpu.GpuDelegate;
 import org.tensorflow.lite.nnapi.NnApiDelegate;
 
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -2212,6 +2213,13 @@ public class PoseEstimator {
     }
 
     private MappedByteBuffer loadModelFile(Context context, String modelName) throws IOException {
+        // 优先从应用私有目录加载（运行时按需下载的模型），否则回退到 assets（打包内置模型）
+        File localFile = ModelManager.getLocalFile(context, modelName);
+        if (localFile.exists() && localFile.length() > 0) {
+            try (FileInputStream fis = new FileInputStream(localFile)) {
+                return fis.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, localFile.length());
+            }
+        }
         try (AssetFileDescriptor afd = context.getAssets().openFd(modelName);
              FileInputStream fis = new FileInputStream(afd.getFileDescriptor())) {
             FileChannel fileChannel = fis.getChannel();

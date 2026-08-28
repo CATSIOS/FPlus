@@ -2,100 +2,66 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="24dp">
+    android:orientation="horizontal">
 
-    <TextView
-        android:id="@+id/text_title"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center_horizontal"
-        android:layout_marginTop="32dp"
-        android:text="@string/title_main"
-        android:textSize="24sp"
-        android:textStyle="bold" />
-
-    <TextView
-        android:id="@+id/text_subtitle"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center_horizontal"
-        android:layout_marginTop="8dp"
-        android:alpha="0.7"
-        android:text="@string/subtitle_main"
-        android:textSize="14sp" />
-
+    <!-- 左侧常驻导航侧边栏 -->
     <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:layout_marginTop="24dp"
-        android:orientation="horizontal">
+        android:layout_width="300dp"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
 
-        <!-- 左侧：可折叠设置（原生 ExpandableListView Android Settings 样式） -->
-        <ExpandableListView
-            android:id="@+id/expandable_settings"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
+        <TextView
+            android:id="@+id/text_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingTop="16dp"
             android:paddingEnd="16dp"
+            android:text="@string/title_main"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/text_subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="8dp"
+            android:alpha="0.7"
+            android:text="@string/subtitle_main"
+            android:textSize="12sp" />
+
+        <ListView
+            android:id="@+id/nav_list"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
             android:divider="#1AFFFFFF"
             android:dividerHeight="1dp"
-            android:listSelector="@android:color/transparent"
-            android:fastScrollEnabled="false" />
-
-        <!-- 中间竖直分割线 -->
-        <View
-            android:layout_width="1dp"
-            android:layout_height="match_parent"
-            android:background="#1AFFFFFF" />
-
-        <!-- 右侧：测速结果与操作 -->
-        <LinearLayout
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:orientation="vertical"
-            android:paddingStart="16dp">
-
-            <ScrollView
-                android:layout_width="match_parent"
-                android:layout_height="0dp"
-                android:layout_weight="1">
-
-                <TextView
-                    android:id="@+id/benchmark_result"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:alpha="0.85"
-                    android:text="@string/benchmark_placeholder"
-                    android:textSize="12sp" />
-            </ScrollView>
-
-            <Button
-                android:id="@+id/btn_benchmark"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:text="@string/btn_benchmark"
-                android:textSize="14sp" />
-
-            <Button
-                android:id="@+id/btn_advanced"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="@string/btn_advanced"
-                android:textSize="14sp" />
-
-            <Button
-                android:id="@+id/btn_start"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:text="@string/btn_start"
-                android:textSize="16sp" />
-        </LinearLayout>
+            android:listSelector="@android:color/transparent" />
     </LinearLayout>
+
+    <!-- 中间竖直分割线 -->
+    <View
+        android:layout_width="1dp"
+        android:layout_height="match_parent"
+        android:background="#1AFFFFFF" />
+
+    <!-- 右侧主区域：仅开始按钮 -->
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <Button
+            android:id="@+id/btn_start"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:minWidth="200dp"
+            android:text="@string/btn_start"
+            android:textSize="18sp" />
+    </FrameLayout>
 
 </LinearLayout>
