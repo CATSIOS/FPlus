@@ -5,6 +5,7 @@ import android.os.Bundle;
 import android.widget.RadioGroup;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.Toolbar;
 
 /** 推理后端选择界面 */
 public class BackendSettingsActivity extends AppCompatActivity {
@@ -13,6 +14,13 @@ public class BackendSettingsActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_backend_settings);
+
+        Toolbar toolbar = findViewById(R.id.toolbar);
+        setSupportActionBar(toolbar);
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+        }
+        toolbar.setNavigationOnClickListener(v -> finish());
 
         SharedPreferences prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
         RadioGroup radioBackend = findViewById(R.id.radio_backend);

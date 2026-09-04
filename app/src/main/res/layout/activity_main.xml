@@ -48,20 +48,32 @@
         android:layout_height="match_parent"
         android:background="#1AFFFFFF" />
 
-    <!-- 右侧主区域：仅开始按钮 -->
-    <FrameLayout
+    <!-- 右侧主区域：当前配置信息 + 开始按钮 -->
+    <LinearLayout
         android:layout_width="0dp"
         android:layout_height="match_parent"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <TextView
+            android:id="@+id/text_config"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:alpha="0.75"
+            android:gravity="center"
+            android:lineSpacingExtra="6dp"
+            android:textSize="15sp" />
 
         <Button
             android:id="@+id/btn_start"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_gravity="center"
+            android:layout_marginTop="24dp"
             android:minWidth="200dp"
             android:text="@string/btn_start"
             android:textSize="18sp" />
-    </FrameLayout>
+    </LinearLayout>
 
 </LinearLayout>

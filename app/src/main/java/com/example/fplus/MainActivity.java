@@ -9,6 +9,7 @@ import android.provider.Settings;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.ListView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -18,10 +19,15 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE_OVERLAY_PERMISSION = 2001;
     private static final int REQUEST_CODE_CAPTURE = 2002;
 
-    private static final String MODEL_DELTA = "deltaforce_640.tflite";
-
     private SharedPreferences prefs;
     private Button btnStart;
+    private TextView textConfig;
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshConfigText();
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -39,7 +45,7 @@ public class MainActivity extends AppCompatActivity {
                 getString(R.string.btn_advanced)
         };
         ListView navList = findViewById(R.id.nav_list);
-        navList.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, navItems));
+        navList.setAdapter(new ArrayAdapter<>(this, R.layout.settings_nav_item, navItems));
         navList.setOnItemClickListener((parent, view, position, id) -> {
             Intent intent;
             switch (position) {
@@ -53,6 +59,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         btnStart = findViewById(R.id.btn_start);
+        textConfig = findViewById(R.id.text_config);
         btnStart.setOnClickListener(v -> {
             // 再次按下"开始"时若服务在运行则停止（toggle 行为）
             if (ScreenCaptureService.getInstance() != null) {
@@ -70,7 +77,27 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String currentModelName() {
-        return prefs.getString("model_name", MODEL_DELTA);
+        return prefs.getString("model_name", ModelManager.DEFAULT_MODEL);
+    }
+
+    /** 在主界面显示当前选择的模型与推理后端（onResume 时刷新，设置页返回后同步） */
+    private void refreshConfigText() {
+        if (textConfig == null) return;
+        String model = currentModelName();
+        textConfig.setText(getString(R.string.main_config_format, model, backendLabel()));
+    }
+
+    private String backendLabel() {
+        String backend = prefs.getString("backend", PoseEstimator.Backend.GPU.name());
+        try {
+            switch (PoseEstimator.Backend.valueOf(backend)) {
+                case NNAPI: return getString(R.string.backend_npu);
+                case GPU:   return getString(R.string.backend_gpu);
+                default:    return getString(R.string.backend_cpu);
+            }
+        } catch (IllegalArgumentException e) {
+            return getString(R.string.backend_gpu);
+        }
     }
 
     /**

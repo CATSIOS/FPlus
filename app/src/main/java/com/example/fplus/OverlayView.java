@@ -176,8 +176,8 @@ public class OverlayView extends View {
             displayBox[1] = box[1];
             displayBox[2] = box[2];
             displayBox[3] = box[3];
-            filterX = new OneEuroFilter(MIN_CUTOFF, BETA);
-            filterY = new OneEuroFilter(MIN_CUTOFF, BETA);
+            filterX = new OneEuroFilter(MIN_CUTOFF, BETA, 6.0);
+            filterY = new OneEuroFilter(MIN_CUTOFF, BETA, 6.0);
             filterX.filter(box[0], timestampNanos);
             filterY.filter(box[1], timestampNanos);
         } else {

@@ -3,23 +3,21 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:paddingStart="8dp"
-    android:paddingEnd="8dp"
-    android:paddingBottom="8dp">
-
-    <Button
-        android:id="@+id/btn_benchmark"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="@string/btn_benchmark"
-        android:textSize="14sp" />
+    android:padding="16dp">
 
     <TextView
         android:id="@+id/benchmark_result"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="16dp"
         android:alpha="0.85"
         android:text="@string/benchmark_placeholder"
         android:textSize="12sp" />
+    <Button
+        android:id="@+id/btn_benchmark"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:text="@string/btn_benchmark" />
+
 </LinearLayout>

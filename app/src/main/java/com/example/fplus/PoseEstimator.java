@@ -55,6 +55,8 @@ public class PoseEstimator {
     // 解决「人物突然入场」场景下被压制 MAX_TRACK_LOST 帧导致的 ~0.5s 延迟
     // 远处小目标置信度通常 < 0.5，仍受保护；清晰人物入场 > 0.5 可即时响应
     private float TAKEOVER_CONF = 0.5f;
+    // 目标锁定：开启后禁用即时接管，只能等当前目标彻底消失（MAX_TRACK_LOST 帧）才允许换锁
+    private boolean TARGET_LOCK_ENABLED = false;
     // ROI（黄框）占短边的比例，缩小让识别区域更聚焦中心
     private float ROI_SCALE = 0.7f;
     // 目标丢失时 ROI 回中的平滑系数（每帧移动剩余距离的比例）
@@ -295,6 +297,10 @@ public class PoseEstimator {
     private static final float OAM_DEPTH_THRESHOLD = 5f;
     // OA-SORT BAM：上一帧 bestPose 的遮挡系数 [0,1]，本帧 trackedBox 更新时降低对观测的信任
     private float lastBestOcclusion = 0f;
+    // BAM 混合门槛：bam 接近 1（观测与预测吻合、无遮挡）时不混合。
+    // 原实现 bam<1 即混合，实际 bam 恒 <1 → 每帧都把速度外推噪声混回 trackedBox，
+    // 大目标（占满 ROI，框中心抖动大）+ 多肢体框遮挡分 >0 时，轨迹被每帧注入噪声缓慢漂移。
+    private static final float BAM_BLEND_THRESH = 0.9f;
 
     // ===== 自适应外推阻尼（残差反馈自学习）=====
     // 问题：固定 PREDICT_SECONDS 外推，目标匀速时贴脸、急停/急转时绿框「冲过头」（前推过冲）。
@@ -534,6 +540,9 @@ public class PoseEstimator {
         // bright_auto：默认开启（"1"/空值 均视为开，"0"才关），与 UI "默认打开"一致
         String autoStr = prefs.getString("bright_auto", "1");
         BRIGHT_AUTO_ENABLED = !"0".equals(autoStr);
+        // 目标锁定：默认关闭（"1"开启，"0"关闭）
+        String lockStr = prefs.getString("target_lock", "0");
+        TARGET_LOCK_ENABLED = "1".equals(lockStr);
         USER_BRIGHT_GAIN = parseFloat(prefs, "bright_gain", 1.3f);
         USER_BRIGHT_OFFSET = parseFloat(prefs, "bright_offset", 25f);
         CUR_BRIGHT_GAIN = USER_BRIGHT_GAIN;
@@ -1517,8 +1526,17 @@ public class PoseEstimator {
             float pxC, pyC;
             if (accMag >= ACC_THRESHOLD) {
                 // CA 模型：x = x0 + v*t + 0.5*a*t²，横向加速时预测更贴合
-                pxC = trackedBox[0] + lastRawVx * steps + 0.5f * accX * steps * steps;
-                pyC = trackedBox[1] + lastRawVy * steps + 0.5f * accY * steps * steps;
+                // 二次项限幅：不超过线性位移。低速大目标（占满 ROI）框中心抖动
+                // 会制造噪声级"加速度"，steps 放大到 5 步后二次项爆炸（数百px），
+                // predTracked 漂出救援缓冲区 → 匹配断链 → 30帧计数走满丢目标
+                float linX = lastRawVx * steps;
+                float linY = lastRawVy * steps;
+                float quaX = 0.5f * accX * steps * steps;
+                float quaY = 0.5f * accY * steps * steps;
+                if (Math.abs(quaX) > Math.abs(linX)) quaX = Math.abs(linX) * Math.signum(quaX);
+                if (Math.abs(quaY) > Math.abs(linY)) quaY = Math.abs(linY) * Math.signum(quaY);
+                pxC = trackedBox[0] + linX + quaX;
+                pyC = trackedBox[1] + linY + quaY;
             } else {
                 // CV 模型：匀速外推
                 pxC = trackedBox[0] + lastRawVx * steps;
@@ -1791,7 +1809,8 @@ public class PoseEstimator {
         if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && !bestMatchedTrack) {
             // 接管阈值：新目标置信度 ≥ TAKEOVER_CONF 时绕过锁定保持，立即切换锁定
             // （解决「人物突然入场」被压制 MAX_TRACK_LOST 帧的延迟；远处小目标 conf 通常 < 0.5 仍受保护）
-            boolean takeover = bestPose != null && bestConf >= TAKEOVER_CONF;
+            // 目标锁定开启时禁用即时接管：只允许当前目标彻底消失（MAX_TRACK_LOST）后换锁
+            boolean takeover = !TARGET_LOCK_ENABLED && bestPose != null && bestConf >= TAKEOVER_CONF;
             if (takeover) {
                 // 高分新目标即时接管：释放旧锁（trackedBox=null），让后续通用路径按「首次锁定」处理 B；
                 // 否则 BAM 混合块会用旧目标 A 的 predTracked 外推位置污染 B（A/B 相距远时 bam≈0 → trackedBox 退回 A）。
@@ -1854,7 +1873,8 @@ public class PoseEstimator {
                 float bam = boxIou(predTracked, newBox) * (1f - lastBestOcclusion);
                 if (bam < 0f) bam = 0f;
                 else if (bam > 1f) bam = 1f;
-                if (bam < 1f) {
+                // 观测与预测吻合（bam 高）时不混合：防止无遮挡帧把外推噪声注入轨迹
+                if (bam < BAM_BLEND_THRESH) {
                     for (int k = 0; k < 4; k++) {
                         newBox[k] = bam * newBox[k] + (1f - bam) * predTracked[k];
                     }

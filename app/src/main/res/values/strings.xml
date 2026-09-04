@@ -24,4 +24,6 @@
     <string name="model_status_downloading">下载中…</string>
     <string name="model_action_download">下载</string>
     <string name="model_action_delete">删除</string>
+    <string name="main_config_format">模型：%1$s\n推理后端：%2$s</string>
+    <string name="model_empty">暂无模型</string>
 </resources>

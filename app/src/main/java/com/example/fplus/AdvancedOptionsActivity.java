@@ -88,6 +88,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "新目标即时接管阈值（0.3~0.9）", GROUP_TRACKING, 0.3, 0.9));
         params.add(new ParamItem("track_dist_weight", "0.25", "距离惩罚权重",
                 "横向断连补分强度（0~0.5）", GROUP_TRACKING, 0, 0.5));
+        params.add(new ParamItem("target_lock", "0", "目标锁定",
+                "开启后锁定当前目标：丢失期间由新目标接管被禁止，直到该目标彻底消失才允许换锁", GROUP_TRACKING, 0, 1));
         params.add(new ParamItem("track_acc_threshold", "0.002", "加速度阈值",
                 "CA 外推触发加速度（0~0.02）", GROUP_TRACKING, 0, 0.02));
         params.add(new ParamItem("anti_crosshair", "0", "抗准心误识别（实验）",
@@ -139,6 +141,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
     private Switch dualVerifySwitch;   // dual_verify 实验开关，editTexts 槽位存 null 占位
     private Switch antiCrosshairSwitch;// anti_crosshair 抗准心开关，editTexts 槽位存 null 占位
     private Switch brightAutoSwitch;   // bright_auto 环境光优化开关，editTexts 槽位存 null 占位
+    private Switch targetLockSwitch;   // target_lock 目标锁定开关，editTexts 槽位存 null 占位
     private SharedPreferences prefs;
 
     @Override
@@ -261,6 +264,16 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 row.addView(sw, swLp);
                 brightAutoSwitch = sw;
                 editTexts.add(null);
+            } else if ("target_lock".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                targetLockSwitch = sw;
+                editTexts.add(null);
             } else {
                 EditText et = new EditText(this);
                 et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
@@ -306,6 +319,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("bright_auto".equals(p.key)) {
                 editor.putString(p.key, brightAutoSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("target_lock".equals(p.key)) {
+                editor.putString(p.key, targetLockSwitch.isChecked() ? "1" : "0");
                 continue;
             }
             String val = editTexts.get(i).getText().toString().trim();
@@ -361,6 +378,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("bright_auto".equals(p.key)) {
                 brightAutoSwitch.setChecked(!"0".equals(p.defValue));
+                continue;
+            }
+            if ("target_lock".equals(p.key)) {
+                targetLockSwitch.setChecked("1".equals(p.defValue));
                 continue;
             }
             editTexts.get(i).setText(p.defValue);

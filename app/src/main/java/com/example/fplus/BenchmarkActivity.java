@@ -8,16 +8,14 @@ import android.widget.Button;
 import android.widget.TextView;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.Toolbar;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-/** 自动测速界面：遍历「模型 × 后端」组合，选出最快并应用 */
+/** 自动测速界面：遍历本地已下载的「模型 × 后端」组合，选出最快并应用 */
 public class BenchmarkActivity extends AppCompatActivity {
-
-    private static final String MODEL_320_OPT = "sunxds_0.8.0_320_opt.tflite";
-    private static final String MODEL_DELTA = "deltaforce_640.tflite";
 
     private SharedPreferences prefs;
     private Button btnBenchmark;
@@ -27,6 +25,13 @@ public class BenchmarkActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_benchmark);
+
+        Toolbar toolbar = findViewById(R.id.toolbar);
+        setSupportActionBar(toolbar);
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+        }
+        toolbar.setNavigationOnClickListener(v -> finish());
 
         prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
         btnBenchmark = findViewById(R.id.btn_benchmark);
@@ -42,7 +47,15 @@ public class BenchmarkActivity extends AppCompatActivity {
             Bitmap testBitmap = Bitmap.createBitmap(720, 450, Bitmap.Config.ARGB_8888);
             testBitmap.eraseColor(0xFF808080);
 
-            String[] models = {MODEL_DELTA, MODEL_320_OPT};
+            String[] models = ModelManager.listLocalModels(this).toArray(new String[0]);
+            if (models.length == 0) {
+                runOnUiThread(() -> {
+                    btnBenchmark.setEnabled(true);
+                    benchmarkResult.setText("没有已下载的模型，请先在模型管理中下载");
+                });
+                testBitmap.recycle();
+                return;
+            }
             // 测速只测 NPU / GPU，CPU 永远最慢，跳过以大幅缩短测速时间
             PoseEstimator.Backend[] backends = {
                     PoseEstimator.Backend.NNAPI,
@@ -136,8 +149,9 @@ public class BenchmarkActivity extends AppCompatActivity {
     }
 
     private String modelLabel(String model) {
-        if (MODEL_DELTA.equals(model)) return "DeltaForce/640";
-        return "320/OPT(原生训练)";
+        return model.endsWith(".tflite")
+                ? model.substring(0, model.length() - ".tflite".length())
+                : model;
     }
 
     private String backendLabel(PoseEstimator.Backend backend) {
