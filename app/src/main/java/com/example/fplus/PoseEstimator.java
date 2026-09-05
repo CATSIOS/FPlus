@@ -530,28 +530,28 @@ public class PoseEstimator {
     private void loadPrefs(Context context) {
         SharedPreferences prefs = context.getSharedPreferences("fplus_settings", Context.MODE_PRIVATE);
         // 每个参数单独 try-catch：避免一个坏值连累后续所有合法参数丢失用户配置
-        CONFIDENCE_THRESHOLD = parseFloat(prefs, "det_conf", 0.15f);
-        VALID_DETECTION_CONF = parseFloat(prefs, "det_valid", 0.2f);
-        MIN_AREA_THRESHOLD = parseFloat(prefs, "det_min_area", 0.01f);
-        TRACK_IOU_THRESHOLD = parseFloat(prefs, "track_iou", 0.2f);
-        CBIoU_BUF_HIGH = parseFloat(prefs, "track_buf_high", 0.3f);
-        CBIoU_BUF_LOW = parseFloat(prefs, "track_buf_low", 0.5f);
-        CBIoU_IOU_LOW = parseFloat(prefs, "track_iou_low", 0.3f);
-        CBIoU_SPEED_REF = parseFloat(prefs, "track_speed_ref", 0.25f);
-        DIST_WEIGHT = parseFloat(prefs, "track_dist_weight", 0.25f);
-        OCM_WEIGHT = parseFloat(prefs, "ocm_weight", 0.15f);
-        OCM_SPEED_REF = parseFloat(prefs, "ocm_speed_ref", 0.01f);
-        ACC_THRESHOLD = parseFloat(prefs, "track_acc_threshold", 0.002f);
-        MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
-        TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
-        PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f);
+        CONFIDENCE_THRESHOLD = parseFloat(prefs, "det_conf", 0.15f, 0.05f, 0.5f);
+        VALID_DETECTION_CONF = parseFloat(prefs, "det_valid", 0.2f, 0.1f, 0.5f);
+        MIN_AREA_THRESHOLD = parseFloat(prefs, "det_min_area", 0.01f, 0.001f, 0.1f);
+        TRACK_IOU_THRESHOLD = parseFloat(prefs, "track_iou", 0.2f, 0f, 1f);
+        CBIoU_BUF_HIGH = parseFloat(prefs, "track_buf_high", 0.3f, 0f, 1f);
+        CBIoU_BUF_LOW = parseFloat(prefs, "track_buf_low", 0.5f, 0f, 1f);
+        CBIoU_IOU_LOW = parseFloat(prefs, "track_iou_low", 0.3f, 0f, 1f);
+        CBIoU_SPEED_REF = parseFloat(prefs, "track_speed_ref", 0.25f, 0.1f, 0.6f);
+        DIST_WEIGHT = parseFloat(prefs, "track_dist_weight", 0.25f, 0f, 0.5f);
+        OCM_WEIGHT = parseFloat(prefs, "ocm_weight", 0.15f, 0f, 0.5f);
+        OCM_SPEED_REF = parseFloat(prefs, "ocm_speed_ref", 0.01f, 0.001f, 0.1f);
+        ACC_THRESHOLD = parseFloat(prefs, "track_acc_threshold", 0.002f, 0f, 0.02f);
+        MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30, 5, 60);
+        TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f, 0.3f, 0.9f);
+        PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f, 0f, 0.2f);
         // 绿框预判：默认开启（"1"/空值均视为开，"0"才关），与 UI "默认打开"一致
         LEAD_PREDICT_ENABLED = !"0".equals(prefs.getString("lead_predict", "1"));
-        COAST_MIN_VEL = parseFloat(prefs, "coast_min_vel", 0.01f);
-        COAST_MAX_FRAMES = parseInt(prefs, "coast_max_frames", 2);
-        CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f);
-        SCORE_W = parseFloat(prefs, "score_w", 0.3f);
-        ROI_SCALE = parseFloat(prefs, "roi_scale", 0.7f);
+        COAST_MIN_VEL = parseFloat(prefs, "coast_min_vel", 0.01f, 0.001f, 0.02f);
+        COAST_MAX_FRAMES = parseInt(prefs, "coast_max_frames", 2, 1, 30);
+        CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f, 0.1f, 0.5f);
+        SCORE_W = parseFloat(prefs, "score_w", 0.3f, 0f, 1f);
+        ROI_SCALE = parseFloat(prefs, "roi_scale", 0.7f, 0.3f, 1.0f);
         // bright_auto：默认开启（"1"/空值 均视为开，"0"才关），与 UI "默认打开"一致
         String autoStr = prefs.getString("bright_auto", "1");
         BRIGHT_AUTO_ENABLED = !"0".equals(autoStr);
@@ -573,7 +573,7 @@ public class PoseEstimator {
         // 双实例并发 PoC 开关（"1"=开），zoom 比例；交叉核验仅在双路开时生效
         DUAL_INFER_ENABLED = "1".equals(prefs.getString("dual_infer", "0"));
         DUAL_VERIFY_ENABLED = DUAL_INFER_ENABLED && "1".equals(prefs.getString("dual_verify", "0"));
-        DUAL_ZOOM = parseFloat(prefs, "dual_zoom", 0.5f);
+        DUAL_ZOOM = parseFloat(prefs, "dual_zoom", 0.5f, 0.3f, 0.8f);
         // 抗准心误识别：独立开关，默认关
         ANTI_CROSSHAIR_ENABLED = "1".equals(prefs.getString("anti_crosshair", "0"));
         antiCrosshairWarned = false;
@@ -588,6 +588,14 @@ public class PoseEstimator {
         }
     }
 
+    /** 解析并收敛到 [min,max]：防御 prefs 被外部写入非法值（如 ROI_SCALE 越界导致 drawBitmap 崩溃） */
+    private float parseFloat(SharedPreferences prefs, String key, float def, float min, float max) {
+        float v = parseFloat(prefs, key, def);
+        if (v < min) return min;
+        if (v > max) return max;
+        return v;
+    }
+
     private int parseInt(SharedPreferences prefs, String key, int def) {
         try {
             return Integer.parseInt(prefs.getString(key, Integer.toString(def)));
@@ -595,6 +603,14 @@ public class PoseEstimator {
             Log.w(TAG, "参数 " + key + " 解析失败，使用默认值 " + def);
             return def;
         }
+    }
+
+    /** 解析并收敛到 [min,max]：防御 prefs 被写入非法值（如 track_max_lost=0 导致状态机退化） */
+    private int parseInt(SharedPreferences prefs, String key, int def, int min, int max) {
+        int v = parseInt(prefs, key, def);
+        if (v < min) return min;
+        if (v > max) return max;
+        return v;
     }
 
     private static Backend[] fallbackOrder(Backend preferred) {
