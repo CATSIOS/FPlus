@@ -27,7 +27,12 @@ public class OverlayView extends View {
     // 1€ 滤波器参数：最小截止频率（Hz，静止平滑度）与速度系数（快速移动响应度）
     // 可调参数（从 SharedPreferences 读取，详见 AdvancedOptionsActivity）
     private double MIN_CUTOFF = 2.0;
-    private double BETA = 8.0;
+    // 1€ 调参（归一化坐标 0~1）：速度单位=屏宽/秒，量级 0.01~0.5，
+    // beta 需远大于像素级建议值才有速度自适应；过低（如 0.3）时 fc≈minCutoff 恒成立，
+    // 自适应失效、动态滞后（"静态稳、动态差"）。beta=4.0：速度 0.4/s 时 fc≈3.6Hz 跟手；
+    // 静止抖动经速度低通(D_CUTOFF=0.3Hz)衰减后 fc≈2Hz，静态仍强平滑。
+    // 上限由 maxCutoff=6Hz 封顶（见 filterX/Y 构造），无 fc 飙升风险。
+    private double BETA = 4.0;
     // 跳变阈值：位移超过该值视为目标切换/误检，限制最大移动量，避免框瞬移
     private float MAX_JUMP = 0.4f;
     // 尺寸平滑系数：越小越平滑（0=完全锁死尺寸，1=不平滑）
@@ -70,10 +75,10 @@ public class OverlayView extends View {
             MIN_CUTOFF = 2.0;
         }
         try {
-            BETA = Double.parseDouble(prefs.getString("overlay_beta", "8.0"));
+            BETA = Double.parseDouble(prefs.getString("overlay_beta", "4.0"));
         } catch (NumberFormatException e) {
-            Log.w(TAG, "overlay_beta 解析失败，使用默认 8.0");
-            BETA = 8.0;
+            Log.w(TAG, "overlay_beta 解析失败，使用默认 4.0");
+            BETA = 4.0;
         }
         try {
             MAX_JUMP = Float.parseFloat(prefs.getString("overlay_max_jump", "0.4"));

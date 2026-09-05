@@ -78,6 +78,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "HIGH 阶段 buffer 扩展比例（0~1）", GROUP_TRACKING, 0, 1));
         params.add(new ParamItem("track_iou_low", "0.3", "C-BIoU LOW 阈值",
                 "LOW 救援 buffered IoU 阈值（0~1）", GROUP_TRACKING, 0, 1));
+        params.add(new ParamItem("ocm_weight", "0.15", "OCM 方向权重",
+                "方向不一致候选的最大惩罚，0 关闭（0~0.5）", GROUP_TRACKING, 0, 0.5));
+        params.add(new ParamItem("ocm_speed_ref", "0.01", "OCM 速度参考",
+                "速度≥此值达满权重，低速降权至半额（0.001~0.1）", GROUP_TRACKING, 0.001, 0.1));
         params.add(new ParamItem("track_buf_low", "0.5", "C-BIoU LOW 缓冲",
                 "LOW 救援 buffer 扩展比例（0~1）", GROUP_TRACKING, 0, 1));
         params.add(new ParamItem("track_speed_ref", "0.25", "速度自适应参考",
@@ -119,8 +123,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
 
         params.add(new ParamItem("overlay_min_cutoff", "2.0", "1€ 最小截止频率",
                 "静止平滑度（0.5~5）", GROUP_OVERLAY, 0.5, 5));
-        params.add(new ParamItem("overlay_beta", "8.0", "1€ 速度系数",
-                "快速响应度（1~20）", GROUP_OVERLAY, 1, 20));
+        params.add(new ParamItem("overlay_beta", "4.0", "1€ 速度系数",
+                "快速响应度（0.1~20）", GROUP_OVERLAY, 0.1, 20));
         params.add(new ParamItem("overlay_max_jump", "0.4", "最大跳变阈值",
                 "目标切换位移限制（0.1~1.0）", GROUP_OVERLAY, 0.1, 1.0));
         params.add(new ParamItem("overlay_size_smooth", "0.45", "尺寸平滑系数",

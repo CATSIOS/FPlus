@@ -252,9 +252,6 @@ public class PoseEstimator {
     // 运动动力学 KF (arxiv 2505.07254)：加速度超过此值切 CA（匀加速）模型外推，
     // 横向加速时 CA 预测更准，减少 predTracked 偏差；加速度小用 CV（匀速）
     private float ACC_THRESHOLD = 0.002f;
-    // 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：匹配前对两框各方向扩展 EXPAND_RATIO
-    // 提升小目标重叠率，避免仅几像素位移导致 IoU 骤降而跟踪断锁
-    private static final float EXPAND_RATIO = 0.15f;
     // OC-SORT OCM：跟踪目标的速度估计（像素/帧），用于匹配前按 lost 帧数做位置外推
     private float trackVelX = 0f;
     private float trackVelY = 0f;
@@ -288,6 +285,10 @@ public class PoseEstimator {
     //   仅在「明显移动 + 短时丢失」时外推衔接，解决大幅移动瞬时丢检测的闪烁
     private float COAST_MIN_VEL = 0.01f;
     private int COAST_MAX_FRAMES = 2;
+    // Coast 滞回记忆：大目标低速真实速度恰在 COAST_MIN_VEL 边界，
+    // 硬阈值随速度噪声在相邻漏检事件间翻转 → 补位框「外推/冻结」抽搐。
+    // 进入需 ≥1.2× 阈值，已激活只需 ≥0.8× 保持，边界两侧留缓冲。
+    private boolean coastEngaged = false;
     // 锁定保持显示窗口：已锁定目标短暂漏检时，补位显示旧目标避免闪烁；
     // 超过此帧数仍无匹配则判定「目标真消失」，停止补位返回 null 让绿框快速淡出。
     // 与 MAX_TRACK_LOST(跟踪状态保留 30 帧) 解耦：显示淡出快，跟踪状态保留久以便目标回归时恢复。
@@ -295,12 +296,19 @@ public class PoseEstimator {
     // OA-SORT（CVPR 2026, arxiv 2603.06034）：OAM 深度排序阈值（像素），
     // bbox 底部 y 差值小于此值不判定遮挡，避免抖动误判
     private static final float OAM_DEPTH_THRESHOLD = 5f;
-    // OA-SORT BAM：上一帧 bestPose 的遮挡系数 [0,1]，本帧 trackedBox 更新时降低对观测的信任
-    private float lastBestOcclusion = 0f;
     // BAM 混合门槛：bam 接近 1（观测与预测吻合、无遮挡）时不混合。
     // 原实现 bam<1 即混合，实际 bam 恒 <1 → 每帧都把速度外推噪声混回 trackedBox，
     // 大目标（占满 ROI，框中心抖动大）+ 多肢体框遮挡分 >0 时，轨迹被每帧注入噪声缓慢漂移。
-    private static final float BAM_BLEND_THRESH = 0.9f;
+    // 0.9→0.95：继续收紧混合区间，状态层更贴观测（少掺预测），
+    // 双重平滑的滞后主要由显示层 1€ 承担，符合 OC-SORT 观测中心理念。
+    private static final float BAM_BLEND_THRESH = 0.95f;
+
+    // ===== OC-SORT OCM（方向一致性，arXiv 2203.14360）=====
+    // 论文第一限制：高帧率下帧间位移噪声与真实位移同量级，仅靠距离的匹配有歧义。
+    // OCM 在匹配竞争分里惩罚「候选相对预测位置的位移方向」与「历史速度方向」不一致的框。
+    // 与其余 track_* 参数一致，运行时从 SharedPreferences 读取（可调）
+    private float OCM_WEIGHT = 0.15f;     // 满速时最大惩罚（从 matchSim 中扣除）
+    private float OCM_SPEED_REF = 0.01f;  // 速度≥此值达满权重；低速惩罚按 0.5~1.0 缓降（不归零）
 
     // ===== 自适应外推阻尼（残差反馈自学习）=====
     // 问题：固定 PREDICT_SECONDS 外推，目标匀速时贴脸、急停/急转时绿框「冲过头」（前推过冲）。
@@ -528,6 +536,8 @@ public class PoseEstimator {
         CBIoU_IOU_LOW = parseFloat(prefs, "track_iou_low", 0.3f);
         CBIoU_SPEED_REF = parseFloat(prefs, "track_speed_ref", 0.25f);
         DIST_WEIGHT = parseFloat(prefs, "track_dist_weight", 0.25f);
+        OCM_WEIGHT = parseFloat(prefs, "ocm_weight", 0.15f);
+        OCM_SPEED_REF = parseFloat(prefs, "ocm_speed_ref", 0.01f);
         ACC_THRESHOLD = parseFloat(prefs, "track_acc_threshold", 0.002f);
         MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
         TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
@@ -975,7 +985,8 @@ public class PoseEstimator {
             float ph = pose.box[3];
 
             // ROI 跟随：下一帧 ROI 中心移到目标中心，避免主角移出 ROI 而丢失
-            updateRoiCenter(px, py);
+            // 传入目标宽度：死区按目标大小反比缩放（方案1），大目标死区收紧防裁剪
+            updateRoiCenter(px, py, pw);
 
             // 转成相对原图的归一化坐标
             pose.box[0] = px / originalWidth;
@@ -1004,15 +1015,22 @@ public class PoseEstimator {
         roiY = (int) Math.max(0, Math.min(originalHeight - roiSize, newCy - roiSize / 2f));
     }
 
-    private void updateRoiCenter(float targetCx, float targetCy) {
+    private void updateRoiCenter(float targetCx, float targetCy, float targetW) {
         float curCx = roiX + roiSize / 2f;
         float curCy = roiY + roiSize / 2f;
         float dx = targetCx - curCx;
         float dy = targetCy - curCy;
         float dist = (float) Math.sqrt(dx * dx + dy * dy);
 
-        // 死区：目标在 ROI 中心 8% 范围内不移动，减少黄框抖动
+        // 死区：目标在 ROI 中心 8% 范围内不移动，减少黄框抖动。
+        // 但大目标（框宽接近 ROI 宽）在死区内自由移动即伸出 ROI 边缘被裁剪，
+        // 且缩放滞后让裁切周期性重演 → 跟踪速度被低估、绿框滞后。
+        // 修正：死区随目标宽度反比缩放——宽 ≤60% ROI 维持 8% 防抖不变；
+        // 再大则收敛到 0%（宽 ≥ROI 时死区消失，ROI 紧跟目标防裁剪）。小目标防抖不受影响。
         float deadZone = roiSize * 0.08f;
+        if (targetW > 1e-3f) {
+            deadZone *= Math.min(1f, roiSize * 0.6f / targetW);
+        }
         if (dist <= deadZone) return;
 
         // 非线性跟随：超出死区部分按平方根缩放
@@ -1645,6 +1663,11 @@ public class PoseEstimator {
                     // 两个目标都匹配锁定框时不再按 conf/位置 score 竞争，避免绿框在目标间帧级横跳；
                     // trackedBox 会更新到选中框，下一帧该框匹配度最高，形成自稳定。
                     float matchSim = simTrack(predTracked, box, dynHighBuffer);
+                    // OC-SORT OCM 方向一致性惩罚：候选相对预测位置的位移方向与历史速度方向
+                    // 夹角越背离惩罚越重。SMOT(arXiv 2507.12087) 对齐：惩罚由 EMA 方向可信度
+                    // 驱动、低速不归零（0.5 下限调制）——低速大目标正是「帧间位移噪声≈真实位移」、
+                    // 最需要方向约束的区间（OC-SORT 限制1）。HIGH/LOW 救援/回收三阶段共用。
+                    matchSim -= ocmDirectionPenalty(predTracked[0], predTracked[1], box[0], box[1]);
                     if (matchSim > bestMatchSim) {
                         bestMatchSim = matchSim;
                         bestMatchedConf = boxConf;
@@ -1749,7 +1772,9 @@ public class PoseEstimator {
                 float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
                 // LOW 救援与 HIGH 一致用 simTrack：bufferedIoU + 距离补分 + 高度相似性
                 // simTrack >= bufferedIoU，阈值保持 CBIoU_IOU_LOW 等效放宽，与 HIGH 策略对齐
-                float sim = simTrack(predTracked, lbBox, CBIoU_BUF_LOW);
+                // OCM 方向惩罚同样生效：HIGH 失配时方向是区分真假目标的强信号
+                float sim = simTrack(predTracked, lbBox, CBIoU_BUF_LOW)
+                        - ocmDirectionPenalty(predTracked[0], predTracked[1], lbBox[0], lbBox[1]);
                 if (sim >= CBIoU_IOU_LOW && sim > bestLowIoU) {
                     bestLowIoU = sim;
                     bestLowBox = lbBox;
@@ -1782,8 +1807,10 @@ public class PoseEstimator {
                 float[] lb = lowBoxes[i];
                 float[] lbBox = new float[]{lb[0], lb[1], lb[2], lb[3]};
                 // Recovery 阶段同样用 simTrack：宽缓冲 + 距离补分 + 高度相似性，
-                // 与 HIGH/LOW 策略一致，进一步提高短遮挡场景的恢复率
-                float sim = simTrack(predTracked, lbBox, RECOVERY_BUF);
+                // 与 HIGH/LOW 策略一致，进一步提高短遮挡场景的恢复率。
+                // OCM 方向惩罚：丢失 ≤RECOVERY_MAX_FRAMES 内速度方向仍可信，防误恢复他目标
+                float sim = simTrack(predTracked, lbBox, RECOVERY_BUF)
+                        - ocmDirectionPenalty(predTracked[0], predTracked[1], lbBox[0], lbBox[1]);
                 if (sim >= RECOVERY_IOU && sim > bestRecoveryIoU) {
                     bestRecoveryIoU = sim;
                     bestRecoveryBox = lbBox;
@@ -1828,12 +1855,21 @@ public class PoseEstimator {
                 lastLeadDx = 0f;
                 lastLeadDy = 0f;
                 leadValid = false;
+                coastEngaged = false;   // 防 A 的外推记忆延续到 B
             } else if (trackLostFrames < LOCK_HOLD_FRAMES) {
                 // 短暂漏检：补位显示旧目标（绿框保持，防闪烁）
                 float[] holdBox = trackedBox;
                 float speedSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
-                if (speedSq >= COAST_MIN_VEL * COAST_MIN_VEL && trackLostFrames <= COAST_MAX_FRAMES) {
-                    float steps = Math.min(trackLostFrames + 1, COAST_MAX_FRAMES);
+                // 滞回：进入需 ≥1.2×COAST_MIN_VEL，激活后 ≥0.8× 即可保持
+                float enterT = COAST_MIN_VEL * 1.2f;
+                float holdT = COAST_MIN_VEL * 0.8f;
+                coastEngaged = coastEngaged ? (speedSq >= holdT * holdT)
+                        : (speedSq >= enterT * enterT);
+                if (coastEngaged && trackLostFrames <= COAST_MAX_FRAMES) {
+                    // 外推量逐帧衰减（SocialTrack 2025 加速衰减思想）：
+                    // 增量 1 → 0.5 → 0.25 帧位移，总位置渐近 2×速度，补位轨迹自然减速停车；
+                    // 替代旧恒定步长 min(lost+1,2)：旧版第2帧起框「悬停」在 2×速度处再骤停
+                    float steps = 2f - 1f / (float) (1 << trackLostFrames);
                     holdBox = new float[] {
                             trackedBox[0] + lastRawVx * steps,
                             trackedBox[1] + lastRawVy * steps,
@@ -1854,7 +1890,8 @@ public class PoseEstimator {
         }
 
         // ===== OA-SORT OAM：计算当前 bestPose 被其他 HIGH 检测框遮挡的系数 =====
-        // 用于下一帧 BAM 加权：遮挡时降低对观测的信任，更多依赖 predTracked
+        // 本帧 BAM 直接取用（OA-SORT 2026 修订版：BAM 由当前帧遮挡图驱动，消除一帧滞后；
+        // 旧实现用上一帧 lastBestOcclusion，30~60fps 下遮挡刚发生的头几帧 BAM 错误地信了观测）
         float currentOcclusion = 0f;
         if (bestPose != null && highCount > 1) {
             currentOcclusion = computeOcclusion(bestPose.box, highBoxes, highCount);
@@ -1864,13 +1901,17 @@ public class PoseEstimator {
         long nowNanos = System.nanoTime();
         if (bestPose != null && !heldByLock) {
             // OA-SORT BAM (Bias-Aware Momentum)：
-            // BAM = IoU(predTracked, Z) · (1 - Oc_prev)
+            // BAM = IoU(predTracked, Z) · (1 - Oc_cur)
             // Z' = BAM · Z + (1 - BAM) · predTracked
-            // 遮挡严重（Oc_prev 大）或观测与预测位置偏离（IoU 低）时，BAM 减小，
+            // 遮挡严重（Oc_cur 大）或观测与预测位置偏离（IoU 低）时，BAM 减小，
             // trackedBox 更多沿用 predTracked 速度外推，防止遮挡中漂移的检测框污染轨迹
             float[] newBox = bestPose.box.clone();
-            if (trackedBox != null && predTracked != null && predTracked != trackedBox) {
-                float bam = boxIou(predTracked, newBox) * (1f - lastBestOcclusion);
+            // OC-SORT ORU 简化版：恢复首帧（trackLostFrames>0）跳过 BAM 混合，全信观测。
+            // 丢失期间 predTracked 是外推位置，恢复帧把它掺进正确观测 = 把错误拖回轨迹，
+            // 论文 ORU 正是为此：恢复关联后先用观测重建状态，而非信任先验估计。
+            if (trackedBox != null && predTracked != null && predTracked != trackedBox
+                    && trackLostFrames == 0) {
+                float bam = boxIou(predTracked, newBox) * (1f - currentOcclusion);
                 if (bam < 0f) bam = 0f;
                 else if (bam > 1f) bam = 1f;
                 // 观测与预测吻合（bam 高）时不混合：防止无遮挡帧把外推噪声注入轨迹
@@ -1880,8 +1921,10 @@ public class PoseEstimator {
                     }
                 }
             }
-            // 速度估计基于混合后的 newBox，保持与 trackedBox 一致性
-            if (lastTrackTimeNanos != 0L && trackedBox != null) {
+            // 速度用混合后 newBox 的位移：BAM 混合等效位置层低通，为大型目标检测抖动
+            // 提供速度估计所需的平滑；EMA 收敛、无发散风险。仅 trackLostFrames==0 的
+            // 连续帧更新；救援帧（HIGH 失配但 LOW 级补回）仍更新，避免动态期速度冻结。
+            if (lastTrackTimeNanos != 0L && trackedBox != null && trackLostFrames == 0) {
                 double dtSec = (nowNanos - lastTrackTimeNanos) / 1_000_000_000.0;
                 if (dtSec > 1e-6) {
                     // 60fps 基准帧时长 (16.6ms) 做归一化
@@ -1905,6 +1948,10 @@ public class PoseEstimator {
                     trackVelX = (1 - adaptiveAlpha) * trackVelX + adaptiveAlpha * rawVx;
                     trackVelY = (1 - adaptiveAlpha) * trackVelY + adaptiveAlpha * rawVy;
                 }
+            } else if (trackedBox != null) {
+                // 恢复帧（trackLostFrames>0）：不更新速度，但刷新计时基准，
+                // 否则下一帧 dtSec 跨整个丢失期 → 速度被稀释（framesElapsed 异常大）
+                lastTrackTimeNanos = nowNanos;
             }
 
             // ===== 自适应外推阻尼反馈：残差 = 本帧观测 - 上帧(跟踪位置 + 外推量) =====
@@ -1942,7 +1989,6 @@ public class PoseEstimator {
             }
 
             trackedBox = newBox;
-            lastBestOcclusion = currentOcclusion;
             trackLostFrames = 0;
             lastTrackTimeNanos = nowNanos;
         } else if (trackedBox != null) {
@@ -1966,7 +2012,7 @@ public class PoseEstimator {
                 lastLeadDy = 0f;
                 leadValid = false;
                 lastTrackTimeNanos = 0L;
-                lastBestOcclusion = 0f;
+                coastEngaged = false;
             }
         }
 
@@ -2102,60 +2148,37 @@ public class PoseEstimator {
     }
 
     /**
-     * @deprecated 已由 C-BIoU {@link #bufferedIoU} 替代，保留以便回退对比。
-     * 自适应相似度度量（YOLOv8-SMOT, arxiv 2507.12087）：
-     * 在 EIoU 基础上对两框各方向扩展 EXPAND_RATIO 后计算 IoU，再叠加中心距离惩罚。
-     * - bbox 扩展提升小目标重叠率（远处小人仅几像素位移 IoU 不再骤降为 0）
-     * - 中心距离惩罚 ρ²/c² 对近邻但不重叠的框仍给出非零相似度，避免跟踪断锁
-     * 整体内联实现，零内存分配，避免 GC 压力。
+     * OC-SORT OCM（arXiv 2203.14360）方向一致性惩罚：
+     * 候选相对预测位置的位移方向与历史速度方向夹角越背离惩罚越重（从 simTrack 得分中扣除）。
+     * <p>
+     * 低速不归零：速度 < OCM_SPEED_REF 仅降权至 0.5（真实低速大目标恰是「帧间位移噪声≈真实位移」、
+     * 最需要方向约束的区间，OC-SORT 限制1）；静止目标速度是噪声，半额惩罚误伤可控。
+     * <p>
+     * 方向稳定门控：瞬时速度与 EMA 速度夹角 <60°（直线/缓弯）才启用——急转弯时
+     * 正确候选位于旧速度方向后方，无条件惩罚会误伤正确框。
+     * <p>
+     * HIGH 匹配 / LOW 救援 / OATrack 回收三阶段共用：救援阶段恰好是 HIGH 失配、
+     * 方向信息最有区分度的时刻。
+     *
+     * @return 应扣减的惩罚（≥0），无有效速度/方向时返回 0
      */
-    @Deprecated
-    private float boxEIoU(float[] boxA, float[] boxB) {
-        // 扩展两框：中心不变，宽高 × (1 + 2*EXPAND_RATIO)
-        float eaW = boxA[2] * (1f + 2f * EXPAND_RATIO);
-        float eaH = boxA[3] * (1f + 2f * EXPAND_RATIO);
-        float ebW = boxB[2] * (1f + 2f * EXPAND_RATIO);
-        float ebH = boxB[3] * (1f + 2f * EXPAND_RATIO);
-
-        // 扩展后两框的角点
-        float ax1 = boxA[0] - eaW / 2f;
-        float ay1 = boxA[1] - eaH / 2f;
-        float ax2 = boxA[0] + eaW / 2f;
-        float ay2 = boxA[1] + eaH / 2f;
-        float bx1 = boxB[0] - ebW / 2f;
-        float by1 = boxB[1] - ebH / 2f;
-        float bx2 = boxB[0] + ebW / 2f;
-        float by2 = boxB[1] + ebH / 2f;
-
-        // 交集
-        float x1 = Math.max(ax1, bx1);
-        float y1 = Math.max(ay1, by1);
-        float x2 = Math.min(ax2, bx2);
-        float y2 = Math.min(ay2, by2);
-        float interW = Math.max(0, x2 - x1);
-        float interH = Math.max(0, y2 - y1);
-        float inter = interW * interH;
-
-        // 并集与 IoU
-        float areaA = eaW * eaH;
-        float areaB = ebW * ebH;
-        float union = areaA + areaB - inter;
-        float iou = union > 0 ? inter / union : 0;
-
-        // EIoU 中心距离惩罚：ρ = 原始框中心点欧氏距离
-        float dcx = boxA[0] - boxB[0];
-        float dcy = boxA[1] - boxB[1];
-        float rho2 = dcx * dcx + dcy * dcy;
-
-        // 最小外接矩形对角线 c（用扩展后框计算）
-        float ex1 = Math.min(ax1, bx1);
-        float ey1 = Math.min(ay1, by1);
-        float ex2 = Math.max(ax2, bx2);
-        float ey2 = Math.max(ay2, by2);
-        float c2 = (ex2 - ex1) * (ex2 - ex1) + (ey2 - ey1) * (ey2 - ey1);
-
-        if (c2 < 1e-6f) return iou;
-        return iou - rho2 / c2;
+    private float ocmDirectionPenalty(float predCx, float predCy, float candCx, float candCy) {
+        float spdSq = trackVelX * trackVelX + trackVelY * trackVelY;
+        if (spdSq <= 1e-12f) return 0f;
+        float rawSpdSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
+        if (rawSpdSq <= 1e-12f) return 0f;
+        // 方向稳定门控：瞬时速度与 EMA 速度夹角 <60°（cosθ > 0.5）
+        if ((lastRawVx * trackVelX + lastRawVy * trackVelY)
+                <= 0.5f * (float) Math.sqrt(rawSpdSq) * (float) Math.sqrt(spdSq)) return 0f;
+        float relX = candCx - predCx;
+        float relY = candCy - predCy;
+        float relLen = (float) Math.sqrt(relX * relX + relY * relY);
+        if (relLen <= 1e-6f) return 0f;
+        float spd = (float) Math.sqrt(spdSq);
+        float cosT = (relX * trackVelX + relY * trackVelY) / (relLen * spd);
+        // 速度调制下限 0.5：静止噪声最多吃半额，真实低速（≈OCM_SPEED_REF）吃全量
+        float speedMod = 0.5f + 0.5f * Math.min(1f, spd / OCM_SPEED_REF);
+        return OCM_WEIGHT * (1f - cosT) * 0.5f * speedMod;
     }
 
     /**
@@ -2324,6 +2347,22 @@ public class PoseEstimator {
         scaleSrcRect = null;
         output = null;
         trackedBox = null;
+        // 跟踪状态数值字段统一复位（含丢失计数、速度估计、外推自适应），
+        // 与 takeover / MAX_TRACK_LOST 释放块口径一致，防实例复用残留状态
+        trackLostFrames = 0;
+        trackVelX = 0f;
+        trackVelY = 0f;
+        lastRawVx = 0f;
+        lastRawVy = 0f;
+        prevRawVx = 0f;
+        prevRawVy = 0f;
+        lastTrackTimeNanos = 0L;
+        coastEngaged = false;
+        adaptiveLeadSec = PREDICT_SECONDS;
+        leadErrEma = 0f;
+        lastLeadDx = 0f;
+        lastLeadDy = 0f;
+        leadValid = false;
         firstInferLogged = false;
         realStatsLogged = false;
         shadowLiftLogged = false;
