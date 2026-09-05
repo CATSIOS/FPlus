@@ -69,10 +69,10 @@ public class OverlayView extends View {
         SharedPreferences prefs = context.getSharedPreferences("fplus_settings", Context.MODE_PRIVATE);
         // 每个参数单独 try-catch：避免一个坏值连累其他参数丢失配置
         try {
-            MIN_CUTOFF = Double.parseDouble(prefs.getString("overlay_min_cutoff", "2.0"));
+            MIN_CUTOFF = Double.parseDouble(prefs.getString("overlay_min_cutoff", "3.0"));
         } catch (NumberFormatException e) {
-            Log.w(TAG, "overlay_min_cutoff 解析失败，使用默认 2.0");
-            MIN_CUTOFF = 2.0;
+            Log.w(TAG, "overlay_min_cutoff 解析失败，使用默认 3.0");
+            MIN_CUTOFF = 3.0;
         }
         try {
             BETA = Double.parseDouble(prefs.getString("overlay_beta", "4.0"));

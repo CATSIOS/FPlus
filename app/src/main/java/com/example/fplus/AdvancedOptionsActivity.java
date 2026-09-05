@@ -123,8 +123,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         params.add(new ParamItem("bright_offset", "25", "亮度偏移",
                 "暗景提亮（0~100）", GROUP_BRIGHT, 0, 100));
 
-        params.add(new ParamItem("overlay_min_cutoff", "2.0", "1€ 最小截止频率",
-                "静止平滑度（0.5~5）", GROUP_OVERLAY, 0.5, 5));
+        params.add(new ParamItem("overlay_min_cutoff", "3.0", "1€ 最小截止频率",
+                "低速跟手度：越高低速越跟手（1~6）", GROUP_OVERLAY, 1, 6));
         params.add(new ParamItem("overlay_beta", "4.0", "1€ 速度系数",
                 "快速响应度（0.1~20）", GROUP_OVERLAY, 0.1, 20));
         params.add(new ParamItem("overlay_max_jump", "0.4", "最大跳变阈值",
@@ -343,6 +343,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("target_lock".equals(p.key)) {
                 editor.putString(p.key, targetLockSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("lead_predict".equals(p.key)) {
+                editor.putString(p.key, leadPredictSwitch.isChecked() ? "1" : "0");
                 continue;
             }
             String val = editTexts.get(i).getText().toString().trim();
