@@ -99,6 +99,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
         params.add(new ParamItem("anti_crosshair", "0", "抗准心误识别（实验）",
                 "开镜瞄具/准心UI误绑定时启用：超小+中心+非人形比例才惩罚，不影响真人", GROUP_TRACKING, 0, 1));
 
+        params.add(new ParamItem("lead_predict", "1", "绿框预判",
+                "开启后绿框按目标速度提前外推抵消延迟；关闭则紧贴检测位置，观感更稳", GROUP_PREDICT, 0, 1));
         params.add(new ParamItem("pred_seconds", "0.083", "预测时长（秒）",
                 "绿框提前量，抵消延迟（0~0.2）", GROUP_PREDICT, 0, 0.2));
         params.add(new ParamItem("coast_min_vel", "0.01", "Coast 速度阈值",
@@ -146,6 +148,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
     private Switch antiCrosshairSwitch;// anti_crosshair 抗准心开关，editTexts 槽位存 null 占位
     private Switch brightAutoSwitch;   // bright_auto 环境光优化开关，editTexts 槽位存 null 占位
     private Switch targetLockSwitch;   // target_lock 目标锁定开关，editTexts 槽位存 null 占位
+    private Switch leadPredictSwitch;  // lead_predict 绿框预判开关，editTexts 槽位存 null 占位
     private SharedPreferences prefs;
 
     @Override
@@ -278,6 +281,17 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 row.addView(sw, swLp);
                 targetLockSwitch = sw;
                 editTexts.add(null);
+            } else if ("lead_predict".equals(p.key)) {
+                // 默认打开：仅显式存 "0" 才关闭（与 bright_auto 同风格）
+                Switch sw = new Switch(this);
+                sw.setChecked(!"0".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                leadPredictSwitch = sw;
+                editTexts.add(null);
             } else {
                 EditText et = new EditText(this);
                 et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
@@ -386,6 +400,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("target_lock".equals(p.key)) {
                 targetLockSwitch.setChecked("1".equals(p.defValue));
+                continue;
+            }
+            if ("lead_predict".equals(p.key)) {
+                leadPredictSwitch.setChecked(!"0".equals(p.defValue));
                 continue;
             }
             editTexts.get(i).setText(p.defValue);

@@ -276,6 +276,10 @@ public class PoseEstimator {
     //   - FPlus 移动端 30fps，0.083s ≈ 2.5 帧抵消端到端延迟
     //   - 仍慢可调到 0.10s，跑过头（急转时绿框冲过）可降到 0.067s
     private float PREDICT_SECONDS = 0.083f;
+    // 绿框预判开关（"lead_predict"）：默认开启。
+    // 开启=绿框按速度提前外推抵消延迟（会略微超前/回退）；关闭=紧贴检测位置，观感更稳
+    // （借鉴开源锁敌：显示框不做预判，仅平滑跟踪，预判留给瞄准点）
+    private boolean LEAD_PREDICT_ENABLED = true;
     // MIN_VEL：速度低于此值视为静止，不外推（避免静止时绿框漂移）
     //   - trackVelX 单位为 60fps 基准每帧位移，0.001 相当于 60fps 下 0.1% 图像宽/帧
     private static final float MIN_VEL = 0.001f;
@@ -542,6 +546,8 @@ public class PoseEstimator {
         MAX_TRACK_LOST = parseInt(prefs, "track_max_lost", 30);
         TAKEOVER_CONF = parseFloat(prefs, "track_takeover", 0.5f);
         PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f);
+        // 绿框预判：默认开启（"1"/空值均视为开，"0"才关），与 UI "默认打开"一致
+        LEAD_PREDICT_ENABLED = !"0".equals(prefs.getString("lead_predict", "1"));
         COAST_MIN_VEL = parseFloat(prefs, "coast_min_vel", 0.01f);
         COAST_MAX_FRAMES = parseInt(prefs, "coast_max_frames", 2);
         CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f);
@@ -2022,7 +2028,8 @@ public class PoseEstimator {
         // 注意：bestPose.box 是独立 new 出来的引用，trackedBox 已 clone，互不影响
         // trackVelX 单位：60fps 基准每帧位移，× 60 转换为"每秒位移"再 × adaptiveLeadSec
         // 补位帧（heldByLock）已由 coast 外推过（或原地补位），跳过预测外推避免双重叠加冲过头
-        if (bestPose != null && trackedBox != null && !heldByLock) {
+        // LEAD_PREDICT_ENABLED=false：绿框预判关闭，不做外推，紧贴检测位置
+        if (bestPose != null && trackedBox != null && !heldByLock && LEAD_PREDICT_ENABLED) {
             float speedSq = trackVelX * trackVelX + trackVelY * trackVelY;
             if (speedSq >= MIN_VEL * MIN_VEL) {
                 float predDx = trackVelX * 60f * adaptiveLeadSec;
@@ -2038,6 +2045,8 @@ public class PoseEstimator {
                 leadValid = false;
             }
         } else {
+            lastLeadDx = 0f;
+            lastLeadDy = 0f;
             leadValid = false;
         }
 
