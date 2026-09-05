@@ -316,6 +316,29 @@ public class ScreenCaptureService extends Service {
             int pixelStride = plane.getPixelStride();
             int rowStride = plane.getRowStride();
 
+            // 双缓冲：交替返回 bitmap A/B，连续两帧返回不同实例
+            // Inference 读上一帧的 3~5ms 远小于两帧间隔（~32ms），无读写冲突
+            int idx = captureBitmapIdx;
+            captureBitmapIdx = (idx + 1) % 2;
+            Bitmap bmp = captureBitmaps[idx];
+            if (bmp == null
+                    || bmp.getWidth() != captureWidth
+                    || bmp.getHeight() != captureHeight) {
+                if (bmp != null) bmp.recycle();
+                bmp = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
+                captureBitmaps[idx] = bmp;
+            }
+
+            // 快速路径：RGBA_8888 且行紧致（rowStride==width*4，主流机型）时，
+            // copyPixelsFromBuffer 一次 memcpy 直入 Bitmap（native像素顺序同为 RGBA），
+            // 跳过 byte[] bulk get + int[] 逐像素打包 + setPixels 两道整帧内存拷贝
+            if (pixelStride == 4 && rowStride == captureWidth * 4) {
+                buffer.rewind();
+                bmp.copyPixelsFromBuffer(buffer);
+                return bmp;
+            }
+
+            // 兜底路径（罕见：非紧致行或 pixelStride!=4）：保留逐像素提取兼容
             buffer.rewind();
             int totalBytes = rowStride * captureHeight;
             if (captureByteArray == null || captureByteArray.length < totalBytes) {
@@ -336,10 +359,10 @@ public class ScreenCaptureService extends Service {
                 for (int y = 0; y < captureHeight; y++) {
                     int rowStart = y * rowStride;
                     for (int x = 0; x < captureWidth; x++) {
-                        int idx = rowStart + x * 4;
-                        int r = captureByteArray[idx] & 0xFF;
-                        int g = captureByteArray[idx + 1] & 0xFF;
-                        int b = captureByteArray[idx + 2] & 0xFF;
+                        int idx2 = rowStart + x * 4;
+                        int r = captureByteArray[idx2] & 0xFF;
+                        int g = captureByteArray[idx2 + 1] & 0xFF;
+                        int b = captureByteArray[idx2 + 2] & 0xFF;
                         pixels[outIndex++] = 0xFF000000 | (r << 16) | (g << 8) | b;
                     }
                 }
@@ -355,19 +378,6 @@ public class ScreenCaptureService extends Service {
                         pixels[outIndex++] = 0xFF000000 | (r << 16) | (g << 8) | b;
                     }
                 }
-            }
-
-            // 双缓冲：交替返回 bitmap A/B，连续两帧返回不同实例
-            // Inference 读上一帧的 3~5ms 远小于两帧间隔（~32ms），无读写冲突
-            int idx = captureBitmapIdx;
-            captureBitmapIdx = (idx + 1) % 2;
-            Bitmap bmp = captureBitmaps[idx];
-            if (bmp == null
-                    || bmp.getWidth() != captureWidth
-                    || bmp.getHeight() != captureHeight) {
-                if (bmp != null) bmp.recycle();
-                bmp = Bitmap.createBitmap(captureWidth, captureHeight, Bitmap.Config.ARGB_8888);
-                captureBitmaps[idx] = bmp;
             }
             bmp.setPixels(pixels, 0, captureWidth, 0, 0, captureWidth, captureHeight);
             return bmp;

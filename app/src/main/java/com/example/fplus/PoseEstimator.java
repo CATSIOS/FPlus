@@ -107,10 +107,9 @@ public class PoseEstimator {
     private FloatBuffer inputFloatBuffer;
     private float[] inputFloats;
     private int[] pixels;
-    // convert 零-copy 优化：copyPixelsToBuffer 一次 memcpy 拿 RGBA byte，跳过 getPixels 的 int 打包；
-    // brightLut 亮度查表（256 项），省每像素浮点乘加 clamp，遍历只做数组读
+    // convert 零-copy 优化：copyPixelsToBuffer 经 ByteBuffer.wrap 一次 memcpy 直入 heap byte[]（RGBA），
+    // 跳过 getPixels 的 int 打包与 DirectBuffer 中转；brightLut 亮度查表（256 项），省每像素浮点乘加 clamp
     private byte[] pixelBytes;
-    private ByteBuffer pixelCopyBuffer;
     private float[] brightLut;
     private Bitmap scaledRoi;
     private Canvas scaleCanvas;
@@ -1086,16 +1085,13 @@ public class PoseEstimator {
         int height = bitmap.getHeight();
         int len = width * height;
         int byteLen = len * 4;
-        if (pixelBytes == null || pixelBytes.length != byteLen || pixelCopyBuffer == null) {
+        if (pixelBytes == null || pixelBytes.length != byteLen) {
             pixelBytes = new byte[byteLen];
-            pixelCopyBuffer = ByteBuffer.allocateDirect(byteLen);
-            pixelCopyBuffer.order(ByteOrder.nativeOrder());
         }
-        // copyPixelsToBuffer 一次 memcpy 拿 RGBA byte，跳过 getPixels 的逐像素 JNI int 打包
-        pixelCopyBuffer.rewind();
-        bitmap.copyPixelsToBuffer(pixelCopyBuffer);
-        pixelCopyBuffer.rewind();
-        pixelCopyBuffer.get(pixelBytes, 0, byteLen);
+        // copyPixelsToBuffer 经 wrap 一次 memcpy 直入 heap byte[]（native RGBA 字节序与 heap 一致），
+        // 省掉 DirectByteBuffer 中转 + 二次 bulk get 的整帧拷贝；跳过 getPixels 的逐像素 JNI int 打包
+        ByteBuffer wrap = ByteBuffer.wrap(pixelBytes, 0, byteLen).order(ByteOrder.nativeOrder());
+        bitmap.copyPixelsToBuffer(wrap);
 
         // ===== 动态亮度增益：根据 BRIGHT_AUTO_ENABLED 开关选路径 =====
         //   开：抽样直方图 → P90 场景亮度(EMA) → mult → 暗部抬升 → 超阈值重建 LUT
@@ -2348,7 +2344,6 @@ public class PoseEstimator {
         inputFloats = null;
         pixels = null;
         pixelBytes = null;
-        pixelCopyBuffer = null;
         brightLut = null;
         scaleCanvas = null;
         scalePaint = null;
