@@ -1,5 +1,25 @@
 <resources>
+    <!-- 语义色（品牌主色） -->
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
-    <color name="accent">#38BDF8</color>
+    <!-- 主紫（Android 深色模式原生 Material3 紫 #D0BCFF）：按钮/开关/选中态强调色 -->
+    <color name="accent">#FFD0BCFF</color>
+    <!-- 紫强调上的前景文字：深紫（M3 onPrimary 色系，与亮紫底对比清晰） -->
+    <color name="on_accent">#342C45</color>
+
+    <!-- ===== 统一深紫面板调色板（设置界面固定深色基底） ===== -->
+    <!-- 全局窗口背景：很深的紫（替代原近黑 #111318） -->
+    <color name="bg_app">#FF0D0718</color>
+    <!-- 侧栏 / 次级面板（比窗口底略亮，形成层级） -->
+    <color name="bg_panel">#FF150D28</color>
+    <!-- 卡片 / 分组块 / Toolbar 基底（面板中最亮一级） -->
+    <color name="bg_surface">#342C45</color>
+    <!-- 主文字：紫调白（替代原冷白，贴合紫色系） -->
+    <color name="text_primary">#FFEDEBF5</color>
+    <!-- 次要文字 / 说明：紫调灰 -->
+    <color name="text_secondary">#FFB2A9CE</color>
+    <!-- 分割线：10% 透明白（原 #1AFFFFFF 命名化） -->
+    <color name="divider">#1AFFFFFF</color>
+    <!-- 按压高亮（半透明白，用于 selectableItemBackground 自绘兜底） -->
+    <color name="ripple">#14FFFFFF</color>
 </resources>

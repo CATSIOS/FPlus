@@ -6,11 +6,10 @@
 
     <androidx.appcompat.widget.Toolbar
         android:id="@+id/toolbar"
+        style="@style/Widget.FPlus.Toolbar"
         android:layout_width="match_parent"
         android:layout_height="?attr/actionBarSize"
-        android:background="?attr/colorPrimary"
-        android:title="@string/models_option_title"
-        android:titleTextColor="@android:color/white" />
+        android:title="@string/models_option_title" />
 
     <ScrollView
         android:layout_width="match_parent"

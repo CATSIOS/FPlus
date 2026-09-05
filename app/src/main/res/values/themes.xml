@@ -5,9 +5,20 @@
         <item name="cornerSize">0dp</item>
     </style>
 
-    <!-- Base application theme. -->
-    <style name="Base.Theme.FPlus" parent="Theme.Material3.DayNight.NoActionBar">
+    <!-- Base application theme：固定深色面板基底（设置界面不受系统明暗影响，保证 #1AFFFFFF 分割线恒可见） -->
+    <style name="Base.Theme.FPlus" parent="Theme.Material3.Dark.NoActionBar">
         <item name="colorPrimary">@color/accent</item>
+        <item name="colorOnPrimary">@color/on_accent</item>
+
+        <!-- 全局背景层级 -->
+        <item name="android:windowBackground">@color/bg_app</item>
+        <item name="android:colorBackground">@color/bg_app</item>
+        <item name="colorSurface">@color/bg_surface</item>
+
+        <!-- 文字颜色：主文字用主题默认（深色主题自动浅色），说明文字用 colorOnSurface 派生 -->
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="colorOnSurface">@color/text_primary</item>
 
         <!-- 除按钮外所有组件 0 圆角（侧导航栏 / 输入框 / 卡片等） -->
         <item name="shapeAppearanceCornerExtraSmall">@style/ShapeAppearance.FPlus.NoCorner</item>
@@ -15,7 +26,18 @@
         <item name="shapeAppearanceCornerMedium">@style/ShapeAppearance.FPlus.NoCorner</item>
         <item name="shapeAppearanceCornerLarge">@style/ShapeAppearance.FPlus.NoCorner</item>
         <item name="shapeAppearanceCornerExtraLarge">@style/ShapeAppearance.FPlus.NoCorner</item>
+
+        <!-- 分割线统一使用命名色 -->
+        <item name="android:listDivider">@color/divider</item>
     </style>
 
     <style name="Theme.FPlus" parent="Base.Theme.FPlus" />
+
+    <!-- ===== 统一子页面 Toolbar 样式：深色面板基底 + 底部细分隔线 ===== -->
+    <style name="Widget.FPlus.Toolbar" parent="Widget.Material3.Toolbar">
+        <item name="android:background">@color/bg_surface</item>
+        <item name="titleTextColor">@color/text_primary</item>
+        <item name="subtitleTextColor">@color/text_secondary</item>
+        <item name="android:elevation">0dp</item>
+    </style>
 </resources>

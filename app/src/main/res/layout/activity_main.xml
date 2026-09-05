@@ -37,7 +37,7 @@
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:divider="#1AFFFFFF"
+            android:divider="@color/divider"
             android:dividerHeight="1dp"
             android:listSelector="@android:color/transparent" />
     </LinearLayout>
@@ -46,7 +46,7 @@
     <View
         android:layout_width="1dp"
         android:layout_height="match_parent"
-        android:background="#1AFFFFFF" />
+        android:background="@color/divider" />
 
     <!-- 右侧主区域：当前配置信息 + 开始按钮 -->
     <LinearLayout

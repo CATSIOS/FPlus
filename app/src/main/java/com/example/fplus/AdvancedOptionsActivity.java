@@ -188,20 +188,21 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                     divider.setBackgroundColor(0x1AFFFFFF);
                     LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
-                    divLp.topMargin = dp(12);
-                    divLp.bottomMargin = dp(12);
+                    divLp.topMargin = dp(16);
+                    divLp.bottomMargin = dp(14);
                     container.addView(divider, divLp);
                 }
                 TextView groupTitle = new TextView(this);
                 groupTitle.setText(p.group);
-                groupTitle.setTextSize(14);
+                groupTitle.setTextSize(13);
+                groupTitle.setTextColor(getColor(R.color.text_secondary));   // text_secondary：组标题弱化，区分条目文字层级
                 groupTitle.setTypeface(null, Typeface.BOLD);
                 groupTitle.setPadding(dp(4), dp(2), 0, dp(2));
                 LinearLayout.LayoutParams groupLp = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT);
                 groupLp.topMargin = i == 0 ? 0 : dp(4);
-                groupLp.bottomMargin = dp(2);
+                groupLp.bottomMargin = dp(6);
                 container.addView(groupTitle, groupLp);
                 lastGroup = p.group;
             }
@@ -210,6 +211,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(4), dp(10), dp(4), dp(10));   // 行内上下留白，条目间不贴太紧
 
             // 左侧文本
             LinearLayout textCol = new LinearLayout(this);
