@@ -33,10 +33,11 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ScreenCaptureService extends Service {
-
     private static final String TAG = "ScreenCaptureService";
     private static final String CHANNEL_ID = "screen_capture_channel";
     private static final int NOTIFICATION_ID = 1;
@@ -61,6 +62,20 @@ public class ScreenCaptureService extends Service {
     private WindowManager windowManager;
     private PowerManager.WakeLock cpuWakeLock;  // PARTIAL_WAKE_LOCK：保持 CPU 不进入 idle 降压
     private boolean isCapturing = false;
+
+    // ===== 视角跟随滑动 =====
+    private ExecutorService swipeExecutor;            // 单线程串行执行滑动，避免两段触摸流重叠
+    private final AtomicBoolean swipeInProgress = new AtomicBoolean(false);
+    private long lastSwipeTime = 0;                   // 上次滑动发起时间，用于冷却
+    private int screenWidth = 0;                      // 旋转适配后的真实屏幕尺寸
+    private int screenHeight = 0;
+    private boolean swipeEnabled = false;             // 滑动跟随开关（高级选项）
+    private boolean swipeMirror = false;              // 镜像滑动开关（方向反转）
+    private static final long SWIPE_COOLDOWN_MS = 200; // 两次滑动最小间隔
+    private static final float SWIPE_DEADZONE_PX = 120f; // 偏离中心小于此距离不滑（死区）
+    private static final float SWIPE_GAIN = 1.0f;        // 滑动距离 = 偏移 × 增益
+    private static final int SWIPE_MIN_DIST = 60;        // 最小滑动距离
+    private static final int SWIPE_MAX_DIST = 400;       // 最大滑动距离（防滑过头）
 
     private MediaProjection.Callback projectionCallback;
 
@@ -124,6 +139,10 @@ public class ScreenCaptureService extends Service {
             return START_NOT_STICKY;
         }
 
+        // 读取滑动跟随相关偏好（默认关闭，需在高级选项手动开启）
+        swipeEnabled = "1".equals(prefs.getString("swipe_enabled", "0"));
+        swipeMirror = "1".equals(prefs.getString("swipe_mirror", "0"));
+
         addOverlayView();
 
         if (resultCode == Activity.RESULT_OK && resultData != null) {
@@ -145,6 +164,11 @@ public class ScreenCaptureService extends Service {
 
     private void startCapture() {
         if (mediaProjection == null || isCapturing) return;
+
+        // 初始化滑动执行器：单线程串行，保证注入的触摸流不会重叠
+        if (swipeExecutor == null || swipeExecutor.isShutdown()) {
+            swipeExecutor = Executors.newSingleThreadExecutor();
+        }
 
         // PARTIAL_WAKE_LOCK：只保持 CPU 运行（屏幕关闭也没用，因为我们要触控/屏显）
         // 作用：避免系统调度器在用户短暂不触控时进入轻度 idle 并立即降频降压
@@ -180,6 +204,10 @@ public class ScreenCaptureService extends Service {
             screenWidth = screenHeight;
             screenHeight = tmp;
         }
+        // 保存旋转适配后的屏幕尺寸，供视角跟随滑动计算中心/偏移
+        this.screenWidth = screenWidth;
+        this.screenHeight = screenHeight;
+
         Log.d(TAG, "Screen real=" + metrics.widthPixels + "x" + metrics.heightPixels +
                 ", rotation=" + rotation + ", capture size=" + screenWidth + "x" + screenHeight);
 
@@ -300,6 +328,10 @@ public class ScreenCaptureService extends Service {
                 }
             });
         }
+        // 姿态检测完成后，判断是否需要滑动视角跟随
+        if (pose != null && pose.box != null) {
+            followTarget(pose.box[0], pose.box[1]);
+        }
     }
 
     private int getScreenRotation() {
@@ -399,6 +431,16 @@ public class ScreenCaptureService extends Service {
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         windowManager.addView(overlayView, params);
+    }
+
+    /**
+     * 转发：获取当前目标中心点的屏幕像素坐标（[x, y]）。
+     * 供外部模块通过 {@link #getInstance()} 直接读取，无需持有 OverlayView 引用。
+     *
+     * @return 屏幕中心点 [x, y]；无目标或悬浮窗未创建时返回 null
+     */
+    public float[] getTargetScreenCenter() {
+        return overlayView != null ? overlayView.getTargetScreenCenter() : null;
     }
 
     private void removeOverlayView() {
@@ -532,9 +574,82 @@ public class ScreenCaptureService extends Service {
             } catch (Throwable ignored) { /* 重复 release 或系统已回收 */ }
             cpuWakeLock = null;
         }
+        // 关闭滑动执行器，等待正在注入的触摸流结束
+        if (swipeExecutor != null) {
+            swipeExecutor.shutdownNow();
+            swipeExecutor = null;
+        }
         instance = null;
     }
 
+    /**
+     * 视角跟随滑动：目标偏离屏幕中心超过死区时，从中心朝目标方向滑动视角。
+     * 在推理线程调用，实际注入在 swipeExecutor 串行执行，避免两段触摸流重叠。
+     *
+     * @param normCx 目标中心归一化 X（0~1，相对捕获帧）
+     * @param normCy 目标中心归一化 Y（0~1，相对捕获帧）
+     */
+    private void followTarget(float normCx, float normCy) {
+        if (!swipeEnabled) return;   // 未开启滑动跟随
+        if (screenWidth <= 0 || screenHeight <= 0) return;
+        if (swipeExecutor == null || swipeExecutor.isShutdown()) return;
+
+        // 滑动执行中：跳过本帧，等上一段完成
+        if (swipeInProgress.get()) return;
+
+        // 冷却：两次滑动间隔过短，避免抖动
+        long now = System.currentTimeMillis();
+        if (now - lastSwipeTime < SWIPE_COOLDOWN_MS) return;
+
+        // 归一化坐标 → 屏幕像素坐标（捕获帧与屏幕等比，直接用 screenW/H 换算）
+        float centerX = screenWidth / 2f;
+        float centerY = screenHeight / 2f;
+        float targetX = normCx * screenWidth;
+        float targetY = normCy * screenHeight;
+
+        // 目标相对中心的偏移
+        float dx = targetX - centerX;
+        float dy = targetY - centerY;
+        float dist = (float) Math.sqrt(dx * dx + dy * dy);
+
+        // 死区：偏离中心太近不滑，避免微小抖动导致频繁滑动
+        if (dist < SWIPE_DEADZONE_PX) return;
+
+        // 方向单位向量（中心 → 目标）
+        float ux = dx / dist;
+        float uy = dy / dist;
+
+        // 镜像滑动：反转方向（目标 → 中心），适配视角映射相反的游戏
+        if (swipeMirror) {
+            ux = -ux;
+            uy = -uy;
+        }
+
+        // 滑动距离与偏移成正比，clamp 防止滑过头
+        int swipeDist = (int) Math.min(SWIPE_MAX_DIST, Math.max(SWIPE_MIN_DIST, dist * SWIPE_GAIN));
+
+        // 起点 = 屏幕中心，终点 = 中心朝目标方向滑 swipeDist 像素
+        int sx = (int) centerX;
+        int sy = (int) centerY;
+        int ex = (int) (centerX + ux * swipeDist);
+        int ey = (int) (centerY + uy * swipeDist);
+
+        // 滑动耗时与距离成正比，clamp 到合理范围
+        long duration = Math.max(120, Math.min(400, swipeDist * 2L));
+
+        lastSwipeTime = now;
+        swipeInProgress.set(true);
+
+        final int fx1 = sx, fy1 = sy, fx2 = ex, fy2 = ey;
+        final long fd = duration;
+        swipeExecutor.execute(() -> {
+            try {
+                ShizukuInputHelper.swipe(fx1, fy1, fx2, fy2, fd);
+            } finally {
+                swipeInProgress.set(false);
+            }
+        });
+    }
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {

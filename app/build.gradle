@@ -51,4 +51,8 @@ dependencies {
     implementation libs.tensorflow.lite.gpu.api
     implementation libs.tensorflow.lite
     implementation libs.tensorflow.lite.gpu
+    //shizuku
+    def shizuku_version = "13.1.5" // 建议使用最新版本
+    implementation "dev.rikka.shizuku:api:$shizuku_version"
+    implementation "dev.rikka.shizuku:provider:$shizuku_version" // 添加此行以支持 Shizuku
 }

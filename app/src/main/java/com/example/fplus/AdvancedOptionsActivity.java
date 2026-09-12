@@ -60,6 +60,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
     private static final String GROUP_BRIGHT = "亮度增强";
     private static final String GROUP_OVERLAY = "Overlay 滤波";
     private static final String GROUP_DUAL = "双实例并发";
+    private static final String GROUP_SWIPE = "滑动跟随";
 
     /** 参数定义表：key 必须与 PoseEstimator/OverlayView 中读取逻辑一致 */
     private final List<ParamItem> params = new ArrayList<>();
@@ -140,6 +141,11 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "双路开时生效：放大区主路候选需第二路同位置也检出才采信，降权背景误识别", GROUP_DUAL, 0, 1));
         params.add(new ParamItem("dual_zoom", "0.5", "放大区比例",
                 "第二路区域相对ROI（0.3~0.8，越小放大越大）", GROUP_DUAL, 0.3, 0.8));
+
+        params.add(new ParamItem("swipe_enabled", "0", "滑动跟随",
+                "开启后目标偏离屏幕中心时自动滑动视角跟随", GROUP_SWIPE, 0, 1));
+        params.add(new ParamItem("swipe_mirror", "0", "镜像滑动",
+                "开启后滑动方向反转，适配视角映射相反的游戏", GROUP_SWIPE, 0, 1));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();
@@ -149,6 +155,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
     private Switch brightAutoSwitch;   // bright_auto 环境光优化开关，editTexts 槽位存 null 占位
     private Switch targetLockSwitch;   // target_lock 目标锁定开关，editTexts 槽位存 null 占位
     private Switch leadPredictSwitch;  // lead_predict 绿框预判开关，editTexts 槽位存 null 占位
+    private Switch swipeEnabledSwitch; // swipe_enabled 滑动跟随开关
+    private Switch swipeMirrorSwitch;  // swipe_mirror 镜像滑动开关
     private SharedPreferences prefs;
 
     @Override
@@ -294,6 +302,26 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 row.addView(sw, swLp);
                 leadPredictSwitch = sw;
                 editTexts.add(null);
+            } else if ("swipe_enabled".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                swipeEnabledSwitch = sw;
+                editTexts.add(null);
+            } else if ("swipe_mirror".equals(p.key)) {
+                Switch sw = new Switch(this);
+                sw.setChecked("1".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                swipeMirrorSwitch = sw;
+                editTexts.add(null);
             } else {
                 EditText et = new EditText(this);
                 et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
@@ -347,6 +375,14 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("lead_predict".equals(p.key)) {
                 editor.putString(p.key, leadPredictSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("swipe_enabled".equals(p.key)) {
+                editor.putString(p.key, swipeEnabledSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("swipe_mirror".equals(p.key)) {
+                editor.putString(p.key, swipeMirrorSwitch.isChecked() ? "1" : "0");
                 continue;
             }
             String val = editTexts.get(i).getText().toString().trim();
@@ -410,6 +446,14 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("lead_predict".equals(p.key)) {
                 leadPredictSwitch.setChecked(!"0".equals(p.defValue));
+                continue;
+            }
+            if ("swipe_enabled".equals(p.key)) {
+                swipeEnabledSwitch.setChecked("1".equals(p.defValue));
+                continue;
+            }
+            if ("swipe_mirror".equals(p.key)) {
+                swipeMirrorSwitch.setChecked("1".equals(p.defValue));
                 continue;
             }
             editTexts.get(i).setText(p.defValue);
