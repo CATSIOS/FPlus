@@ -98,6 +98,16 @@ public class OverlayView extends View {
             Log.w(TAG, "overlay_ease 解析失败，使用默认 0.4");
             EASE_KEEP = 0.4f;
         }
+
+        // lead_predict 开启时：外推已负责时间对齐，显示层降级为「轻平滑」，
+        // 避免双重平滑冲突（外推往前推、滤波往后拉，导致绿框忽前忽后）。
+        //   - 关闭二阶 ease：EASE_KEEP 是无条件的恒定滞后，与外推直接冲突
+        //   - 1€ 截止频率提到 maxCutoff(6.0)：外推已补偿移动延迟，滤波只需滤抖动，
+        //     无需速度自适应，固定高截止频率把滞后降到最小
+        if (!"0".equals(prefs.getString("lead_predict", "1"))) {
+            EASE_KEEP = 0f;
+            MIN_CUTOFF = 6.0;
+        }
     }
 
     private void initPaints() {

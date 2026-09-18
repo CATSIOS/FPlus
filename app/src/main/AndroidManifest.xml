@@ -13,6 +13,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- CPU 保活锁：防止进入 idle 时 CPU 降压降频（抗热退化配套使用，低电量系统会自动忽略） -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 安装 APK（Android 8.0+ 安装未知来源应用） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:allowBackup="true"
@@ -79,6 +81,17 @@
             android:enabled="true"
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- APK 自更新用 FileProvider：共享缓存目录下的 update.apk 给系统安装器 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 </manifest>

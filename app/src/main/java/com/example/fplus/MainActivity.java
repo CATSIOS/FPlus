@@ -5,15 +5,21 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.ListView;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
+
+import java.io.File;
 
 import rikka.shizuku.Shizuku;
 
@@ -26,6 +32,8 @@ public class MainActivity extends AppCompatActivity {
     private SharedPreferences prefs;
     private Button btnStart;
     private TextView textConfig;
+    private ProgressBar progressUpdate;
+    private TextView textUpdate;
 
     private Shizuku.OnRequestPermissionResultListener permissionListener;
     private Shizuku.OnBinderReceivedListener binderReceivedListener;
@@ -49,18 +57,23 @@ public class MainActivity extends AppCompatActivity {
                 getString(R.string.model_option_title),
                 getString(R.string.gpu_option_title),
                 getString(R.string.models_option_title),
+                getString(R.string.update_option_title),
                 getString(R.string.benchmark_option_title),
                 getString(R.string.btn_advanced)
         };
         ListView navList = findViewById(R.id.nav_list);
         navList.setAdapter(new ArrayAdapter<>(this, R.layout.settings_nav_item, navItems));
         navList.setOnItemClickListener((parent, view, position, id) -> {
+            if (position == 3) {
+                checkForAppUpdate();
+                return;
+            }
             Intent intent;
             switch (position) {
                 case 0: intent = new Intent(this, ModelSettingsActivity.class); break;
                 case 1: intent = new Intent(this, BackendSettingsActivity.class); break;
                 case 2: intent = new Intent(this, ModelManagerActivity.class); break;
-                case 3: intent = new Intent(this, BenchmarkActivity.class); break;
+                case 4: intent = new Intent(this, BenchmarkActivity.class); break;
                 default: intent = new Intent(this, AdvancedOptionsActivity.class); break;
             }
             startActivity(intent);
@@ -68,6 +81,8 @@ public class MainActivity extends AppCompatActivity {
 
         btnStart = findViewById(R.id.btn_start);
         textConfig = findViewById(R.id.text_config);
+        progressUpdate = findViewById(R.id.progress_update);
+        textUpdate = findViewById(R.id.text_update);
         btnStart.setOnClickListener(v -> {
             if (ScreenCaptureService.getInstance() != null) {
                 stopService(new Intent(this, ScreenCaptureService.class));
@@ -129,6 +144,97 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Shizuku 服务未运行，滑动跟随无法使用", Toast.LENGTH_LONG).show();
         } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
             Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE);
+        }
+    }
+
+    /**
+     * 一键更新 APK：后台检查 GitHub Releases 最新版本，有新版则下载并调起安装。
+     */
+    private void checkForAppUpdate() {
+        Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> UpdateManager.checkLatest(this, new UpdateManager.CheckCallback() {
+            @Override
+            public void onNoUpdate() {
+                runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                        "已是最新版本", Toast.LENGTH_SHORT).show());
+            }
+
+            @Override
+            public void onUpdateAvailable(String newVersion, String downloadUrl) {
+                runOnUiThread(() -> {
+                    Toast.makeText(MainActivity.this,
+                            "发现新版本 " + newVersion + "，开始下载…", Toast.LENGTH_SHORT).show();
+                    progressUpdate.setProgress(0);
+                    progressUpdate.setVisibility(View.VISIBLE);
+                    textUpdate.setVisibility(View.VISIBLE);
+                    textUpdate.setText("正在下载 " + newVersion + "… 0%");
+                });
+                UpdateManager.downloadApk(MainActivity.this, downloadUrl,
+                        new UpdateManager.DownloadCallback() {
+                            @Override
+                            public void onProgress(long downloaded, long total) {
+                                runOnUiThread(() -> {
+                                    if (total > 0) {
+                                        int pct = (int) (downloaded * 100 / total);
+                                        progressUpdate.setProgress(pct);
+                                        textUpdate.setText("正在下载 " + newVersion
+                                                + "… " + pct + "%");
+                                    } else {
+                                        textUpdate.setText("正在下载 " + newVersion
+                                                + "… " + (downloaded / 1024) + " KB");
+                                    }
+                                });
+                            }
+
+                            @Override
+                            public void onSuccess(File apkFile) {
+                                runOnUiThread(() -> {
+                                    progressUpdate.setVisibility(View.GONE);
+                                    textUpdate.setVisibility(View.GONE);
+                                    installApk(apkFile);
+                                });
+                            }
+
+                            @Override
+                            public void onError(String message) {
+                                runOnUiThread(() -> {
+                                    progressUpdate.setVisibility(View.GONE);
+                                    textUpdate.setVisibility(View.GONE);
+                                    Toast.makeText(MainActivity.this,
+                                            "下载失败：" + message, Toast.LENGTH_LONG).show();
+                                });
+                            }
+                        });
+            }
+
+            @Override
+            public void onError(String message) {
+                runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                        "检查失败：" + message, Toast.LENGTH_LONG).show());
+            }
+        })).start();
+    }
+
+    /** 调起系统安装器安装 APK（FileProvider 共享缓存目录下的 update.apk） */
+    private void installApk(File apkFile) {
+        if (!apkFile.exists()) {
+            Toast.makeText(this, "APK 文件不存在", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Uri apkUri = FileProvider.getUriForFile(this,
+                    getPackageName() + ".fileprovider", apkFile);
+            intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } else {
+            intent.setDataAndType(Uri.fromFile(apkFile), "application/vnd.android.package-archive");
+        }
+        try {
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "无法打开安装器：" + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 

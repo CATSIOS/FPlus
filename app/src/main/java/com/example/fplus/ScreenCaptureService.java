@@ -73,10 +73,11 @@ public class ScreenCaptureService extends Service {
     private boolean swipeMirror = false;              // 镜像滑动开关（方向反转）
     private float swipeSmooth = 0.35f;                // 平滑系数：每帧滑动距离 = 偏差 × 此值（lerp 逼近）
     private float swipeGain = 1.0f;                   // 滑动增益：灵敏度补偿，高敏调小、低敏调大
+    private float swipeDeadzone = 120f;               // 死区（px）：偏离中心小于此值不滑
+    private int swipeMaxDist = 400;                   // 最大滑动距离（px）：单次滑动上限，防过冲
+    private float swipeCurve = 1.0f;                  // 非线性指数：1=线性，>1 近处精细/远处激进
     private static final long SWIPE_COOLDOWN_MS = 50;  // 两次滑动最小间隔（lerp 逼近需连续小幅滑动）
-    private static final float SWIPE_DEADZONE_PX = 120f; // 偏离中心小于此距离不滑（死区）
     private static final int SWIPE_MIN_DIST = 8;         // 最小滑动距离：太近不滑，避免终点抖动
-    private static final int SWIPE_MAX_DIST = 400;       // 最大滑动距离（防极端情况滑过头）
 
     private MediaProjection.Callback projectionCallback;
 
@@ -155,6 +156,24 @@ public class ScreenCaptureService extends Service {
             swipeGain = 1.0f;
         }
         swipeGain = Math.max(0.1f, Math.min(3.0f, swipeGain)); // clamp 到合法范围
+        try {
+            swipeDeadzone = Float.parseFloat(prefs.getString("swipe_deadzone", "120"));
+        } catch (NumberFormatException e) {
+            swipeDeadzone = 120f;
+        }
+        swipeDeadzone = Math.max(40f, Math.min(300f, swipeDeadzone));
+        try {
+            swipeMaxDist = (int) Float.parseFloat(prefs.getString("swipe_maxdist", "400"));
+        } catch (NumberFormatException e) {
+            swipeMaxDist = 400;
+        }
+        swipeMaxDist = Math.max(100, Math.min(800, swipeMaxDist));
+        try {
+            swipeCurve = Float.parseFloat(prefs.getString("swipe_curve", "1.0"));
+        } catch (NumberFormatException e) {
+            swipeCurve = 1.0f;
+        }
+        swipeCurve = Math.max(0.3f, Math.min(2.5f, swipeCurve));
 
         addOverlayView();
 
@@ -626,7 +645,7 @@ public class ScreenCaptureService extends Service {
         float dist = (float) Math.sqrt(dx * dx + dy * dy);
 
         // 死区：偏离中心太近不滑，避免微小抖动导致频繁滑动
-        if (dist < SWIPE_DEADZONE_PX) return;
+        if (dist < swipeDeadzone) return;
 
         // 方向单位向量（中心 → 目标）
         float ux = dx / dist;
@@ -638,10 +657,13 @@ public class ScreenCaptureService extends Service {
             uy = -uy;
         }
 
-        // lerp 逼近：每帧滑动距离 = 偏差 × 平滑系数 × 增益。
-        // 平滑系数决定「逼近比例」，增益做灵敏度补偿（高敏调小、低敏调大），两者解耦。
-        int swipeDist = (int) (dist * swipeSmooth * swipeGain);
-        swipeDist = Math.min(swipeDist, SWIPE_MAX_DIST);
+        // 非线性映射：把「偏差」映射到「滑动距离」，实现远处大步、近处精调。
+        //   norm = dist / maxDist（封顶 1）；swipeCurve>1 时，近处 norm 小 → norm^curve 更小 → 精细微调，
+        //   远处 norm 大 → norm^curve 更大 → 大步快速接近。swipeCurve=1 退化为线性。
+        float norm = Math.min(1f, dist / swipeMaxDist);
+        float shaped = (float) Math.pow(norm, swipeCurve);
+        int swipeDist = (int) (shaped * swipeMaxDist * swipeSmooth * swipeGain);
+        swipeDist = Math.min(swipeDist, swipeMaxDist);
         if (swipeDist < SWIPE_MIN_DIST) return;  // 太近不滑，避免终点抖动
 
         // 起点 = 屏幕中心，终点 = 中心朝目标方向滑 swipeDist 像素

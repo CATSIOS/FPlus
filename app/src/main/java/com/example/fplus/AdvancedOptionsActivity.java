@@ -150,6 +150,12 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "每帧滑动距离 = 偏差 × 此值，越小越平滑（0.05~1.0）", GROUP_SWIPE, 0.05, 1.0));
         params.add(new ParamItem("swipe_gain", "1.0", "滑动增益",
                 "灵敏度补偿：高敏调小、低敏调大（0.1~3.0）", GROUP_SWIPE, 0.1, 3.0));
+        params.add(new ParamItem("swipe_deadzone", "120", "滑动死区",
+                "目标偏离中心小于此距离不滑，防止抖动（40~300px）", GROUP_SWIPE, 40, 300));
+        params.add(new ParamItem("swipe_maxdist", "400", "最大滑动距离",
+                "单次滑动上限，防滑过头（100~800px）", GROUP_SWIPE, 100, 800));
+        params.add(new ParamItem("swipe_curve", "1.0", "滑动曲线指数",
+                "非线性强度：1=线性，>1 近处精细/远处大步（0.3~2.5）", GROUP_SWIPE, 0.3, 2.5));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();
