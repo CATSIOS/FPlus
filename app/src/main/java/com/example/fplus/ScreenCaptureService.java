@@ -71,11 +71,11 @@ public class ScreenCaptureService extends Service {
     private int screenHeight = 0;
     private boolean swipeEnabled = false;             // 滑动跟随开关（高级选项）
     private boolean swipeMirror = false;              // 镜像滑动开关（方向反转）
-    private static final long SWIPE_COOLDOWN_MS = 200; // 两次滑动最小间隔
+    private float swipeSmooth = 0.35f;                // 平滑系数：每帧滑动距离 = 偏差 × 此值（lerp 逼近）
+    private static final long SWIPE_COOLDOWN_MS = 50;  // 两次滑动最小间隔（lerp 逼近需连续小幅滑动）
     private static final float SWIPE_DEADZONE_PX = 120f; // 偏离中心小于此距离不滑（死区）
-    private static final float SWIPE_GAIN = 1.0f;        // 滑动距离 = 偏移 × 增益
-    private static final int SWIPE_MIN_DIST = 60;        // 最小滑动距离
-    private static final int SWIPE_MAX_DIST = 400;       // 最大滑动距离（防滑过头）
+    private static final int SWIPE_MIN_DIST = 8;         // 最小滑动距离：太近不滑，避免终点抖动
+    private static final int SWIPE_MAX_DIST = 400;       // 最大滑动距离（防极端情况滑过头）
 
     private MediaProjection.Callback projectionCallback;
 
@@ -142,6 +142,12 @@ public class ScreenCaptureService extends Service {
         // 读取滑动跟随相关偏好（默认关闭，需在高级选项手动开启）
         swipeEnabled = "1".equals(prefs.getString("swipe_enabled", "0"));
         swipeMirror = "1".equals(prefs.getString("swipe_mirror", "0"));
+        try {
+            swipeSmooth = Float.parseFloat(prefs.getString("swipe_smooth", "0.35"));
+        } catch (NumberFormatException e) {
+            swipeSmooth = 0.35f;
+        }
+        swipeSmooth = Math.max(0.05f, Math.min(1.0f, swipeSmooth)); // clamp 到合法范围
 
         addOverlayView();
 
@@ -625,8 +631,11 @@ public class ScreenCaptureService extends Service {
             uy = -uy;
         }
 
-        // 滑动距离与偏移成正比，clamp 防止滑过头
-        int swipeDist = (int) Math.min(SWIPE_MAX_DIST, Math.max(SWIPE_MIN_DIST, dist * SWIPE_GAIN));
+        // lerp 逼近：每帧滑动距离 = 偏差 × 平滑系数，而非一步滑到位。
+        // 目标偏离远时滑动量大，接近中心时自动减速，形成平滑跟手效果。
+        int swipeDist = (int) (dist * swipeSmooth);
+        swipeDist = Math.min(swipeDist, SWIPE_MAX_DIST);
+        if (swipeDist < SWIPE_MIN_DIST) return;  // 太近不滑，避免终点抖动
 
         // 起点 = 屏幕中心，终点 = 中心朝目标方向滑 swipeDist 像素
         int sx = (int) centerX;

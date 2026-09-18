@@ -146,6 +146,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "开启后目标偏离屏幕中心时自动滑动视角跟随", GROUP_SWIPE, 0, 1));
         params.add(new ParamItem("swipe_mirror", "0", "镜像滑动",
                 "开启后滑动方向反转，适配视角映射相反的游戏", GROUP_SWIPE, 0, 1));
+        params.add(new ParamItem("swipe_smooth", "0.35", "滑动平滑系数",
+                "每帧滑动距离 = 偏差 × 此值，越小越平滑（0.05~1.0）", GROUP_SWIPE, 0.05, 1.0));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();

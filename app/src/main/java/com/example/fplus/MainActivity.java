@@ -35,6 +35,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         refreshConfigText();
+        checkShizukuStatus();
     }
 
     @Override
@@ -113,6 +114,22 @@ public class MainActivity extends AppCompatActivity {
         binderDeadListener = () -> runOnUiThread(() ->
                 Toast.makeText(this, "Shizuku 服务已断开", Toast.LENGTH_SHORT).show());
         Shizuku.addBinderDeadListener(binderDeadListener);
+    }
+
+    /**
+     * 主动检测 Shizuku 状态：onResume 时调用。
+     * binderReceivedListener 只在 Shizuku 已运行时才触发，若服务从未启动则无任何提示；
+     * 此处用 pingBinder 主动探测，在开启滑动跟随但 Shizuku 未运行时给出提示。
+     */
+    private void checkShizukuStatus() {
+        boolean swipeEnabled = "1".equals(prefs.getString("swipe_enabled", "0"));
+        if (!swipeEnabled) return;  // 未开启滑动跟随，无需 Shizuku
+
+        if (!Shizuku.pingBinder()) {
+            Toast.makeText(this, "Shizuku 服务未运行，滑动跟随无法使用", Toast.LENGTH_LONG).show();
+        } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE);
+        }
     }
 
     private String currentModelName() {
