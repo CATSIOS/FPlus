@@ -1,25 +1,26 @@
 package com.example.fplus;
 
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.Settings;
-import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.ListView;
-import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.content.FileProvider;
-
-import java.io.File;
 
 import rikka.shizuku.Shizuku;
 
@@ -32,8 +33,10 @@ public class MainActivity extends AppCompatActivity {
     private SharedPreferences prefs;
     private Button btnStart;
     private TextView textConfig;
-    private ProgressBar progressUpdate;
-    private TextView textUpdate;
+
+    private long downloadId = -1;               // 当前下载任务的 ID
+    private boolean updating = false;           // 是否正在检查/下载更新（防重复点击）
+    private BroadcastReceiver downloadReceiver;
 
     private Shizuku.OnRequestPermissionResultListener permissionListener;
     private Shizuku.OnBinderReceivedListener binderReceivedListener;
@@ -52,6 +55,7 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
+        registerDownloadReceiver();
 
         String[] navItems = {
                 getString(R.string.model_option_title),
@@ -81,8 +85,6 @@ public class MainActivity extends AppCompatActivity {
 
         btnStart = findViewById(R.id.btn_start);
         textConfig = findViewById(R.id.text_config);
-        progressUpdate = findViewById(R.id.progress_update);
-        textUpdate = findViewById(R.id.text_update);
         btnStart.setOnClickListener(v -> {
             if (ScreenCaptureService.getInstance() != null) {
                 stopService(new Intent(this, ScreenCaptureService.class));
@@ -148,13 +150,20 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 一键更新 APK：后台检查 GitHub Releases 最新版本，有新版则下载并调起安装。
+     * 一键更新 APK：后台检查 GitHub Releases 最新版本，有新版则交给系统 DownloadManager 下载。
+     * DownloadManager 支持后台下载 + 通知栏进度，切后台/退出界面都不中断。
      */
     private void checkForAppUpdate() {
+        if (updating) {
+            Toast.makeText(this, "正在更新中，请稍候…", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        updating = true;
         Toast.makeText(this, "正在检查更新…", Toast.LENGTH_SHORT).show();
         new Thread(() -> UpdateManager.checkLatest(this, new UpdateManager.CheckCallback() {
             @Override
             public void onNoUpdate() {
+                updating = false;
                 runOnUiThread(() -> Toast.makeText(MainActivity.this,
                         "已是最新版本", Toast.LENGTH_SHORT).show());
             }
@@ -164,73 +173,83 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     Toast.makeText(MainActivity.this,
                             "发现新版本 " + newVersion + "，开始下载…", Toast.LENGTH_SHORT).show();
-                    progressUpdate.setProgress(0);
-                    progressUpdate.setVisibility(View.VISIBLE);
-                    textUpdate.setVisibility(View.VISIBLE);
-                    textUpdate.setText("正在下载 " + newVersion + "… 0%");
+                    startDownload(newVersion, downloadUrl);
                 });
-                UpdateManager.downloadApk(MainActivity.this, downloadUrl,
-                        new UpdateManager.DownloadCallback() {
-                            @Override
-                            public void onProgress(long downloaded, long total) {
-                                runOnUiThread(() -> {
-                                    if (total > 0) {
-                                        int pct = (int) (downloaded * 100 / total);
-                                        progressUpdate.setProgress(pct);
-                                        textUpdate.setText("正在下载 " + newVersion
-                                                + "… " + pct + "%");
-                                    } else {
-                                        textUpdate.setText("正在下载 " + newVersion
-                                                + "… " + (downloaded / 1024) + " KB");
-                                    }
-                                });
-                            }
-
-                            @Override
-                            public void onSuccess(File apkFile) {
-                                runOnUiThread(() -> {
-                                    progressUpdate.setVisibility(View.GONE);
-                                    textUpdate.setVisibility(View.GONE);
-                                    installApk(apkFile);
-                                });
-                            }
-
-                            @Override
-                            public void onError(String message) {
-                                runOnUiThread(() -> {
-                                    progressUpdate.setVisibility(View.GONE);
-                                    textUpdate.setVisibility(View.GONE);
-                                    Toast.makeText(MainActivity.this,
-                                            "下载失败：" + message, Toast.LENGTH_LONG).show();
-                                });
-                            }
-                        });
             }
 
             @Override
             public void onError(String message) {
+                updating = false;
                 runOnUiThread(() -> Toast.makeText(MainActivity.this,
                         "检查失败：" + message, Toast.LENGTH_LONG).show());
             }
         })).start();
     }
 
-    /** 调起系统安装器安装 APK（FileProvider 共享缓存目录下的 update.apk） */
-    private void installApk(File apkFile) {
-        if (!apkFile.exists()) {
-            Toast.makeText(this, "APK 文件不存在", Toast.LENGTH_SHORT).show();
-            return;
+    /** 用系统 DownloadManager 发起下载，下载完成通过广播回调触发安装 */
+    private void startDownload(String version, String downloadUrl) {
+        try {
+            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(downloadUrl));
+            request.setTitle("FPlus " + version);
+            request.setDescription("正在下载更新…");
+            request.setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            // 下载到公共 Download 目录，文件名带版本号
+            String fileName = "FPlus_" + version + ".apk";
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+            // GitHub 下载要求带 User-Agent
+            request.addRequestHeader("User-Agent", "FPlus-Updater");
+            request.setMimeType("application/vnd.android.package-archive");
+
+            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            downloadId = dm.enqueue(request);
+        } catch (Exception e) {
+            updating = false;
+            Toast.makeText(this, "无法发起下载：" + e.getMessage(), Toast.LENGTH_LONG).show();
         }
+    }
+
+    /** 注册下载完成广播，收到后查询状态并触发安装 */
+    private void registerDownloadReceiver() {
+        if (downloadReceiver != null) return;
+        downloadReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (downloadId < 0) return;
+                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+                if (id != downloadId) return;
+
+                DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                DownloadManager.Query query = new DownloadManager.Query().setFilterById(downloadId);
+                try (Cursor cursor = dm.query(query)) {
+                    if (cursor == null || !cursor.moveToFirst()) return;
+                    int status = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                        updating = false;
+                        installApk(dm.getUriForDownloadedFile(downloadId));
+                    } else if (status == DownloadManager.STATUS_FAILED) {
+                        updating = false;
+                        Toast.makeText(MainActivity.this,
+                                "下载失败，请重试", Toast.LENGTH_LONG).show();
+                    }
+                } catch (Exception e) {
+                    updating = false;
+                }
+            }
+        };
+        registerReceiver(downloadReceiver,
+                new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                        ? Context.RECEIVER_EXPORTED
+                        : 0);
+    }
+
+    /** 调起系统安装器安装 content:// URI 的 APK（DownloadManager 下载完成后的产物） */
+    private void installApk(Uri apkUri) {
         Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            Uri apkUri = FileProvider.getUriForFile(this,
-                    getPackageName() + ".fileprovider", apkFile);
-            intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        } else {
-            intent.setDataAndType(Uri.fromFile(apkFile), "application/vnd.android.package-archive");
-        }
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         try {
             startActivity(intent);
         } catch (Exception e) {
@@ -309,5 +328,9 @@ public class MainActivity extends AppCompatActivity {
         if (permissionListener != null) Shizuku.removeRequestPermissionResultListener(permissionListener);
         if (binderReceivedListener != null) Shizuku.removeBinderReceivedListener(binderReceivedListener);
         if (binderDeadListener != null) Shizuku.removeBinderDeadListener(binderDeadListener);
+        if (downloadReceiver != null) {
+            unregisterReceiver(downloadReceiver);
+            downloadReceiver = null;
+        }
     }
 }
