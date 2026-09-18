@@ -20,11 +20,9 @@ public class ShizukuInputHelper {
 
     private static Object sInputManager;
     private static Method sInjectMethod;
-    private static boolean sInitFailed = false;
 
     private static synchronized boolean init() {
         if (sInputManager != null) return true;
-        if (sInitFailed) return false;
         try {
             IBinder binder = SystemServiceHelper.getSystemService("input");
             IBinder wrapped = new ShizukuBinderWrapper(binder);
@@ -36,14 +34,16 @@ public class ShizukuInputHelper {
                     "injectInputEvent", InputEvent.class, int.class);
             return true;
         } catch (Throwable t) {
-            sInitFailed = true;
+            // 初始化失败（通常是 Shizuku 未就绪）：清空字段，允许下次重试，
+            // 不能用永久标志锁死，否则 Shizuku 授权后滑动依然失效
+            sInputManager = null;
+            sInjectMethod = null;
             return false;
         }
     }
 
     /** Shizuku 是否就绪（服务在线 + 权限授予 + 反射初始化成功） */
     public static synchronized boolean isReady() {
-        if (sInitFailed) return false;
         try {
             if (!Shizuku.pingBinder()) return false;
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) return false;
@@ -62,7 +62,7 @@ public class ShizukuInputHelper {
      * @return true 表示注入完成
      */
     public static boolean swipe(int x1, int y1, int x2, int y2, long duration) {
-        if (!init()) return false;
+        if (!isReady()) return false;
         if (duration <= 0) duration = 200;
         try {
             long downTime = SystemClock.uptimeMillis();

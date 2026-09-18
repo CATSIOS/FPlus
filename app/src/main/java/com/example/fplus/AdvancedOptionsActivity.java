@@ -148,6 +148,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "开启后滑动方向反转，适配视角映射相反的游戏", GROUP_SWIPE, 0, 1));
         params.add(new ParamItem("swipe_smooth", "0.35", "滑动平滑系数",
                 "每帧滑动距离 = 偏差 × 此值，越小越平滑（0.05~1.0）", GROUP_SWIPE, 0.05, 1.0));
+        params.add(new ParamItem("swipe_gain", "1.0", "滑动增益",
+                "灵敏度补偿：高敏调小、低敏调大（0.1~3.0）", GROUP_SWIPE, 0.1, 3.0));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();

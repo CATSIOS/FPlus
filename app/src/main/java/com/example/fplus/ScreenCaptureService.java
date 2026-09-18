@@ -72,6 +72,7 @@ public class ScreenCaptureService extends Service {
     private boolean swipeEnabled = false;             // 滑动跟随开关（高级选项）
     private boolean swipeMirror = false;              // 镜像滑动开关（方向反转）
     private float swipeSmooth = 0.35f;                // 平滑系数：每帧滑动距离 = 偏差 × 此值（lerp 逼近）
+    private float swipeGain = 1.0f;                   // 滑动增益：灵敏度补偿，高敏调小、低敏调大
     private static final long SWIPE_COOLDOWN_MS = 50;  // 两次滑动最小间隔（lerp 逼近需连续小幅滑动）
     private static final float SWIPE_DEADZONE_PX = 120f; // 偏离中心小于此距离不滑（死区）
     private static final int SWIPE_MIN_DIST = 8;         // 最小滑动距离：太近不滑，避免终点抖动
@@ -148,6 +149,12 @@ public class ScreenCaptureService extends Service {
             swipeSmooth = 0.35f;
         }
         swipeSmooth = Math.max(0.05f, Math.min(1.0f, swipeSmooth)); // clamp 到合法范围
+        try {
+            swipeGain = Float.parseFloat(prefs.getString("swipe_gain", "1.0"));
+        } catch (NumberFormatException e) {
+            swipeGain = 1.0f;
+        }
+        swipeGain = Math.max(0.1f, Math.min(3.0f, swipeGain)); // clamp 到合法范围
 
         addOverlayView();
 
@@ -631,9 +638,9 @@ public class ScreenCaptureService extends Service {
             uy = -uy;
         }
 
-        // lerp 逼近：每帧滑动距离 = 偏差 × 平滑系数，而非一步滑到位。
-        // 目标偏离远时滑动量大，接近中心时自动减速，形成平滑跟手效果。
-        int swipeDist = (int) (dist * swipeSmooth);
+        // lerp 逼近：每帧滑动距离 = 偏差 × 平滑系数 × 增益。
+        // 平滑系数决定「逼近比例」，增益做灵敏度补偿（高敏调小、低敏调大），两者解耦。
+        int swipeDist = (int) (dist * swipeSmooth * swipeGain);
         swipeDist = Math.min(swipeDist, SWIPE_MAX_DIST);
         if (swipeDist < SWIPE_MIN_DIST) return;  // 太近不滑，避免终点抖动
 
