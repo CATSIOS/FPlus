@@ -1,18 +1,11 @@
 package com.example.fplus;
 
-import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
-import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.database.Cursor;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
-import android.os.Environment;
 import android.provider.Settings;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -34,9 +27,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnStart;
     private TextView textConfig;
 
-    private long downloadId = -1;               // 当前下载任务的 ID
     private boolean updating = false;           // 是否正在检查/下载更新（防重复点击）
-    private BroadcastReceiver downloadReceiver;
 
     private Shizuku.OnRequestPermissionResultListener permissionListener;
     private Shizuku.OnBinderReceivedListener binderReceivedListener;
@@ -55,7 +46,6 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
-        registerDownloadReceiver();
 
         String[] navItems = {
                 getString(R.string.model_option_title),
@@ -150,8 +140,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 一键更新 APK：后台检查 GitHub Releases 最新版本，有新版则交给系统 DownloadManager 下载。
-     * DownloadManager 支持后台下载 + 通知栏进度，切后台/退出界面都不中断。
+     * 一键更新 APK：后台检查 GitHub Releases 最新版本。
+     * 有新版则弹出对话框展示更新日志，点「更新」后用浏览器打开 APK 直接下载链接（走用户代理）。
      */
     private void checkForAppUpdate() {
         if (updating) {
@@ -169,12 +159,9 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onUpdateAvailable(String newVersion, String downloadUrl) {
-                runOnUiThread(() -> {
-                    Toast.makeText(MainActivity.this,
-                            "发现新版本 " + newVersion + "，开始下载…", Toast.LENGTH_SHORT).show();
-                    startDownload(newVersion, downloadUrl);
-                });
+            public void onUpdateAvailable(UpdateManager.LatestVersion version) {
+                updating = false;
+                runOnUiThread(() -> showUpdateDialog(version));
             }
 
             @Override
@@ -186,74 +173,23 @@ public class MainActivity extends AppCompatActivity {
         })).start();
     }
 
-    /** 用系统 DownloadManager 发起下载，下载完成通过广播回调触发安装 */
-    private void startDownload(String version, String downloadUrl) {
-        try {
-            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(downloadUrl));
-            request.setTitle("FPlus " + version);
-            request.setDescription("正在下载更新…");
-            request.setNotificationVisibility(
-                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            // 下载到公共 Download 目录，文件名带版本号
-            String fileName = "FPlus_" + version + ".apk";
-            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
-            // GitHub 下载要求带 User-Agent
-            request.addRequestHeader("User-Agent", "FPlus-Updater");
-            request.setMimeType("application/vnd.android.package-archive");
-
-            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
-            downloadId = dm.enqueue(request);
-        } catch (Exception e) {
-            updating = false;
-            Toast.makeText(this, "无法发起下载：" + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
+    /** 弹出更新对话框：展示版本号和更新日志，点「更新」用浏览器下载 APK */
+    private void showUpdateDialog(UpdateManager.LatestVersion version) {
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("发现新版本 " + version.versionName)
+                .setMessage(version.changelog.isEmpty() ? "有新版本可用" : version.changelog)
+                .setPositiveButton("更新", (dialog, which) -> openDownloadUrl(version.downloadUrl))
+                .setNegativeButton("取消", null)
+                .show();
     }
 
-    /** 注册下载完成广播，收到后查询状态并触发安装 */
-    private void registerDownloadReceiver() {
-        if (downloadReceiver != null) return;
-        downloadReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (downloadId < 0) return;
-                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
-                if (id != downloadId) return;
-
-                DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
-                DownloadManager.Query query = new DownloadManager.Query().setFilterById(downloadId);
-                try (Cursor cursor = dm.query(query)) {
-                    if (cursor == null || !cursor.moveToFirst()) return;
-                    int status = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS));
-                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                        updating = false;
-                        installApk(dm.getUriForDownloadedFile(downloadId));
-                    } else if (status == DownloadManager.STATUS_FAILED) {
-                        updating = false;
-                        Toast.makeText(MainActivity.this,
-                                "下载失败，请重试", Toast.LENGTH_LONG).show();
-                    }
-                } catch (Exception e) {
-                    updating = false;
-                }
-            }
-        };
-        registerReceiver(downloadReceiver,
-                new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-                        ? Context.RECEIVER_EXPORTED
-                        : 0);
-    }
-
-    /** 调起系统安装器安装 content:// URI 的 APK（DownloadManager 下载完成后的产物） */
-    private void installApk(Uri apkUri) {
-        Intent intent = new Intent(Intent.ACTION_VIEW);
-        intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    /** 用浏览器打开 APK 直接下载链接（走用户代理） */
+    private void openDownloadUrl(String downloadUrl) {
         try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl));
             startActivity(intent);
         } catch (Exception e) {
-            Toast.makeText(this, "无法打开安装器：" + e.getMessage(), Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "无法打开浏览器：" + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
@@ -328,9 +264,5 @@ public class MainActivity extends AppCompatActivity {
         if (permissionListener != null) Shizuku.removeRequestPermissionResultListener(permissionListener);
         if (binderReceivedListener != null) Shizuku.removeBinderReceivedListener(binderReceivedListener);
         if (binderDeadListener != null) Shizuku.removeBinderDeadListener(binderDeadListener);
-        if (downloadReceiver != null) {
-            unregisterReceiver(downloadReceiver);
-            downloadReceiver = null;
-        }
     }
 }
