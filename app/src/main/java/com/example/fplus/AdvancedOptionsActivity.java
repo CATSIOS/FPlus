@@ -156,6 +156,8 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 "单次滑动上限，防滑过头（100~800px）", GROUP_SWIPE, 100, 800));
         params.add(new ParamItem("swipe_curve", "1.0", "滑动曲线指数",
                 "非线性强度：1=线性，>1 近处精细/远处大步（0.3~2.5）", GROUP_SWIPE, 0.3, 2.5));
+        params.add(new ParamItem("cmc_enabled", "1", "相机运动补偿",
+                "滑动跟随时画面整体平移，冻结速度估计并放宽匹配，避免断锁", GROUP_SWIPE, 0, 1));
     }
 
     private final List<EditText> editTexts = new ArrayList<>();
@@ -167,6 +169,7 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
     private Switch leadPredictSwitch;  // lead_predict 绿框预判开关，editTexts 槽位存 null 占位
     private Switch swipeEnabledSwitch; // swipe_enabled 滑动跟随开关
     private Switch swipeMirrorSwitch;  // swipe_mirror 镜像滑动开关
+    private Switch cmcSwitch;          // cmc_enabled 相机运动补偿开关
     private SharedPreferences prefs;
 
     @Override
@@ -332,6 +335,17 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
                 row.addView(sw, swLp);
                 swipeMirrorSwitch = sw;
                 editTexts.add(null);
+            } else if ("cmc_enabled".equals(p.key)) {
+                // 默认打开：仅显式存 "0" 才关闭（与 lead_predict 同风格）
+                Switch sw = new Switch(this);
+                sw.setChecked(!"0".equals(prefs.getString(p.key, p.defValue)));
+                LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                swLp.setMarginStart(dp(12));
+                row.addView(sw, swLp);
+                cmcSwitch = sw;
+                editTexts.add(null);
             } else {
                 EditText et = new EditText(this);
                 et.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
@@ -393,6 +407,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("swipe_mirror".equals(p.key)) {
                 editor.putString(p.key, swipeMirrorSwitch.isChecked() ? "1" : "0");
+                continue;
+            }
+            if ("cmc_enabled".equals(p.key)) {
+                editor.putString(p.key, cmcSwitch.isChecked() ? "1" : "0");
                 continue;
             }
             String val = editTexts.get(i).getText().toString().trim();
@@ -464,6 +482,10 @@ public class AdvancedOptionsActivity extends AppCompatActivity {
             }
             if ("swipe_mirror".equals(p.key)) {
                 swipeMirrorSwitch.setChecked("1".equals(p.defValue));
+                continue;
+            }
+            if ("cmc_enabled".equals(p.key)) {
+                cmcSwitch.setChecked(!"0".equals(p.defValue));
                 continue;
             }
             editTexts.get(i).setText(p.defValue);

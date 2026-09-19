@@ -15,7 +15,7 @@ android {
         minSdk 29
         targetSdk 36
         versionCode 8
-        versionName "1.4.8"
+        versionName "1.5.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -29,7 +29,7 @@ android {
     buildTypes {
         release {
             optimization {
-                enable false
+                enable true
             }
             // 复用调试密钥签名，使 release 产物可直接安装（个人发布用）
             signingConfig signingConfigs.debug

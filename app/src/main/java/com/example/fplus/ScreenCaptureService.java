@@ -677,6 +677,11 @@ public class ScreenCaptureService extends Service {
 
         lastSwipeTime = now;
         swipeInProgress.set(true);
+        // CMC：滑动跟随时画面整体平移，通知推理层冻结速度估计 + 放宽匹配，避免 IoU 骤降断锁
+        final PoseEstimator estimatorForCmc = poseEstimator;
+        if (estimatorForCmc != null) {
+            estimatorForCmc.setCameraMotionActive(true);
+        }
 
         final int fx1 = sx, fy1 = sy, fx2 = ex, fy2 = ey;
         final long fd = duration;
@@ -685,6 +690,8 @@ public class ScreenCaptureService extends Service {
                 ShizukuInputHelper.swipe(fx1, fy1, fx2, fy2, fd);
             } finally {
                 swipeInProgress.set(false);
+                final PoseEstimator est = poseEstimator;
+                if (est != null) est.setCameraMotionActive(false);
             }
         });
     }

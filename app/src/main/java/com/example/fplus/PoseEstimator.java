@@ -213,7 +213,11 @@ public class PoseEstimator {
     // 论文默认 60 帧（≈2秒），但游戏场景目标短暂出框/被遮挡后通常 1 秒内回归
     // 过短（原 20 帧=0.67 秒）会导致目标短暂闪身后回来重新锁定慢
     private int MAX_TRACK_LOST = 30;
-    // C-BIoU Tracker（roboflow 2026 benchmark, HOTA 63.0 > OC-SORT 61.9）
+    // C-BIoU Tracker：roboflow trackers v2.3.0 基准（2026-03）——MOT17 HOTA 63.0/IDF1 79.1、
+    // SportsMOT HOTA 73.1，均优于 OC-SORT（MOT17 61.9）；但低于 BoT-SORT（MOT17 63.7/MOTA 79.2）。
+    // BoT-SORT 优势来自 CMC（相机运动补偿，稀疏光流）；本项目滑动跟随时画面整体平移，
+    // 属同类场景，故补了 CMC 轻量替代（cameraMotionActive：冻结速度 + 放宽匹配）。
+    // 评估口径应以 DanceTrack（快速运动/相机运动，贴近 FPS）为准，而非 MOT17（行人监控静态相机）。
     // 替代 ByteTrack 纯 EIoU 匹配：buffer 扩展（中心不变，宽高×(1+2*buf)）后再算 IoU，
     // 解决 FPS 横向快速移动时纯 IoU 骤降断锁。两阶段 buffer/阈值不同：
     //   HIGH 阶段：小 buffer(0.3)+低阈值(0.2)，高速仍能匹配
@@ -254,6 +258,12 @@ public class PoseEstimator {
     // OC-SORT OCM：跟踪目标的速度估计（像素/帧），用于匹配前按 lost 帧数做位置外推
     private float trackVelX = 0f;
     private float trackVelY = 0f;
+    // CMC（相机运动补偿）轻量替代：滑动跟随注入触摸时画面整体平移，目标在图像中的
+    // 表观位移被全局相机运动污染。此时冻结速度估计（不把相机运动算进 trackVel），
+    // 并放宽匹配（buffer 放大到 LOW 上限 + 跳过方向惩罚），避免 IoU 骤降断锁。
+    private volatile boolean cameraMotionActive = false;
+    // CMC 开关（"cmc_enabled"）：默认开启。关闭时即使滑动跟随生效也不触发 CMC 补偿
+    private boolean CMC_ENABLED = true;
     // 最后一次匹配的瞬时速度（未 EMA 平滑），Coast 外推专用：响应变向更快，
     // 避免 EMA 速度残留旧方向导致「角色变向丢失时绿框反向滑动」
     private float lastRawVx = 0f;
@@ -547,6 +557,8 @@ public class PoseEstimator {
         PREDICT_SECONDS = parseFloat(prefs, "pred_seconds", 0.083f, 0f, 0.2f);
         // 绿框预判：默认开启（"1"/空值均视为开，"0"才关），与 UI "默认打开"一致
         LEAD_PREDICT_ENABLED = !"0".equals(prefs.getString("lead_predict", "1"));
+        // CMC：默认开启（"1"/空值 均视为开，"0"才关），与 UI "默认打开"一致
+        CMC_ENABLED = !"0".equals(prefs.getString("cmc_enabled", "1"));
         COAST_MIN_VEL = parseFloat(prefs, "coast_min_vel", 0.01f, 0.001f, 0.02f);
         COAST_MAX_FRAMES = parseInt(prefs, "coast_max_frames", 2, 1, 30);
         CENTER_SIGMA = parseFloat(prefs, "score_center_sigma", 0.2f, 0.1f, 0.5f);
@@ -1585,7 +1597,10 @@ public class PoseEstimator {
         // 速度归一化 = 速度 / 框宽，达到 SPEED_REF 时 buffer 从 BUF_HIGH 线性放大到 BUF_LOW
         // 静止时小 buffer 防误配，快移时大 buffer 防失配
         float dynHighBuffer = CBIoU_BUF_HIGH;
-        if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && trackedBox[2] > 1e-3f) {
+        if (CMC_ENABLED && cameraMotionActive) {
+            // CMC：滑动跟随画面整体平移，帧间 IoU 骤降，buffer 直接放大到 LOW 上限防失配
+            dynHighBuffer = CBIoU_BUF_LOW;
+        } else if (trackedBox != null && trackLostFrames < MAX_TRACK_LOST && trackedBox[2] > 1e-3f) {
             float speed = (float) Math.sqrt(lastRawVx * lastRawVx + lastRawVy * lastRawVy);
             float speedNorm = speed / trackedBox[2];
             float t = speedNorm / CBIoU_SPEED_REF;
@@ -1942,7 +1957,8 @@ public class PoseEstimator {
             // 速度用混合后 newBox 的位移：BAM 混合等效位置层低通，为大型目标检测抖动
             // 提供速度估计所需的平滑；EMA 收敛、无发散风险。仅 trackLostFrames==0 的
             // 连续帧更新；救援帧（HIGH 失配但 LOW 级补回）仍更新，避免动态期速度冻结。
-            if (lastTrackTimeNanos != 0L && trackedBox != null && trackLostFrames == 0) {
+            if (lastTrackTimeNanos != 0L && trackedBox != null && trackLostFrames == 0
+                    && !(CMC_ENABLED && cameraMotionActive)) {
                 double dtSec = (nowNanos - lastTrackTimeNanos) / 1_000_000_000.0;
                 if (dtSec > 1e-6) {
                     // 60fps 基准帧时长 (16.6ms) 做归一化
@@ -1967,8 +1983,8 @@ public class PoseEstimator {
                     trackVelY = (1 - adaptiveAlpha) * trackVelY + adaptiveAlpha * rawVy;
                 }
             } else if (trackedBox != null) {
-                // 恢复帧（trackLostFrames>0）：不更新速度，但刷新计时基准，
-                // 否则下一帧 dtSec 跨整个丢失期 → 速度被稀释（framesElapsed 异常大）
+                // 恢复帧（trackLostFrames>0）或 CMC 冻结（滑动跟随画面平移）：不更新速度，
+                // 但刷新计时基准，否则下一帧 dtSec 跨整个丢失/滑动期 → 速度被稀释
                 lastTrackTimeNanos = nowNanos;
             }
 
@@ -2184,6 +2200,7 @@ public class PoseEstimator {
      * @return 应扣减的惩罚（≥0），无有效速度/方向时返回 0
      */
     private float ocmDirectionPenalty(float predCx, float predCy, float candCx, float candCy) {
+        if (CMC_ENABLED && cameraMotionActive) return 0f;  // CMC：相机运动时方向信息不可靠，跳过方向惩罚
         float spdSq = trackVelX * trackVelX + trackVelY * trackVelY;
         if (spdSq <= 1e-12f) return 0f;
         float rawSpdSq = lastRawVx * lastRawVx + lastRawVy * lastRawVy;
@@ -2301,6 +2318,11 @@ public class PoseEstimator {
 
     public int getRoiSize() {
         return roiSize;
+    }
+
+    /** 通知推理层「滑动跟随正在注入触摸」（画面整体平移），触发 CMC 轻量替代 */
+    public void setCameraMotionActive(boolean active) {
+        cameraMotionActive = active;
     }
 
     public Backend getBackend() {

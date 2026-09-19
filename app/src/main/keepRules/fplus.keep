@@ -1,0 +1,5 @@
+# Shizuku 安全网：该库内部依赖隐藏 API 反射与 Binder 跨进程调用，
+# 且 Shizuku 服务端会通过 ShizukuProvider 与本进程通信。
+# 库体积很小，保留类名以免 R8 重命名 / 内联后出现运行时问题。
+-keep class rikka.shizuku.** { *; }
+-keep class moe.shizuku.** { *; }
