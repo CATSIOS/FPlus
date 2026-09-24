@@ -196,28 +196,33 @@ Java_com_example_fplus_TouchMonitorService_nativeStart(JNIEnv *env, jobject thiz
     g_touchFd = find_real_touchscreen();
 }
 
-JNIEXPORT jint JNICALL
-Java_com_example_fplus_TouchMonitorService_nativeIsUserTouching(JNIEnv *env, jobject thiz) {
+/* 排空一次事件缓冲（供 Java 侧一次 getState 调用三个 getter 前调用） */
+JNIEXPORT void JNICALL
+Java_com_example_fplus_TouchMonitorService_nativePoll(JNIEnv *env, jobject thiz) {
     (void) env;
     (void) thiz;
     poll_user_touch();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_fplus_TouchMonitorService_nativeTouchingFlag(JNIEnv *env, jobject thiz) {
+    (void) env;
+    (void) thiz;
     return g_userTouching;
 }
 
 JNIEXPORT jfloat JNICALL
-Java_com_example_fplus_TouchMonitorService_nativeGetTouchX(JNIEnv *env, jobject thiz) {
+Java_com_example_fplus_TouchMonitorService_nativeTouchX(JNIEnv *env, jobject thiz) {
     (void) env;
     (void) thiz;
-    poll_user_touch();
     if (g_touchXMax <= 0) return 0.0f;
     return (jfloat) g_touchX / (jfloat) g_touchXMax;
 }
 
 JNIEXPORT jfloat JNICALL
-Java_com_example_fplus_TouchMonitorService_nativeGetTouchY(JNIEnv *env, jobject thiz) {
+Java_com_example_fplus_TouchMonitorService_nativeTouchY(JNIEnv *env, jobject thiz) {
     (void) env;
     (void) thiz;
-    poll_user_touch();
     if (g_touchYMax <= 0) return 0.0f;
     return (jfloat) g_touchY / (jfloat) g_touchYMax;
 }

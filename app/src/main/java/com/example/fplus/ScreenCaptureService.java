@@ -66,7 +66,6 @@ public class ScreenCaptureService extends Service {
     // ===== 视角跟随滑动 =====
     private ExecutorService swipeExecutor;            // 单线程串行执行滑动，避免两段触摸流重叠
     private TouchMonitorClient touchMonitor;          // 触摸屏监听（检测用户手动触摸 → 让路）
-    private long lastTouchDiag = 0;                   // 触摸坐标诊断日志限流
     private final AtomicBoolean swipeInProgress = new AtomicBoolean(false);
     private long lastSwipeTime = 0;                   // 上次滑动发起时间，用于冷却
     private int screenWidth = 0;                      // 旋转适配后的真实屏幕尺寸
@@ -473,16 +472,6 @@ public class ScreenCaptureService extends Service {
         windowManager.addView(overlayView, params);
     }
 
-    /**
-     * 转发：获取当前目标中心点的屏幕像素坐标（[x, y]）。
-     * 供外部模块通过 {@link #getInstance()} 直接读取，无需持有 OverlayView 引用。
-     *
-     * @return 屏幕中心点 [x, y]；无目标或悬浮窗未创建时返回 null
-     */
-    public float[] getTargetScreenCenter() {
-        return overlayView != null ? overlayView.getTargetScreenCenter() : null;
-    }
-
     private void removeOverlayView() {
         if (overlayView != null) {
             windowManager.removeView(overlayView);
@@ -641,16 +630,8 @@ public class ScreenCaptureService extends Service {
 
         // 检测让路：仅当用户手指在屏幕右下 1/4 区域按下时才让路
         if (touchMonitor != null && touchMonitor.isUserTouching()) {
-            float tx = touchMonitor.getTouchX();
-            float ty = touchMonitor.getTouchY();
-            long now = System.currentTimeMillis();
-            if (now - lastTouchDiag > 1000) {
-                lastTouchDiag = now;
-                Log.d(TAG, "touch x=" + String.format(java.util.Locale.US, "%.2f", tx)
-                        + " y=" + String.format(java.util.Locale.US, "%.2f", ty));
-            }
             // 屏幕右下 = 触摸屏 y 大（屏幕右）+ x 小（屏幕下），横屏旋转映射
-            if (tx <= 0.5f && ty >= 0.5f) {
+            if (touchMonitor.getTouchX() <= 0.5f && touchMonitor.getTouchY() >= 0.5f) {
                 return;
             }
         }

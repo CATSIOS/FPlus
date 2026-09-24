@@ -34,18 +34,9 @@ public class TouchMonitorService extends ITouchMonitor.Stub {
     }
 
     @Override
-    public boolean isUserTouching() {
-        return nativeIsUserTouching() != 0;
-    }
-
-    @Override
-    public float getTouchX() {
-        return nativeGetTouchX();
-    }
-
-    @Override
-    public float getTouchY() {
-        return nativeGetTouchY();
+    public float[] getState() {
+        nativePoll();   // 一次性排空缓冲
+        return new float[]{ nativeTouchingFlag(), nativeTouchX(), nativeTouchY() };
     }
 
     static {
@@ -53,8 +44,9 @@ public class TouchMonitorService extends ITouchMonitor.Stub {
     }
 
     private native void nativeStart();
-    private native int nativeIsUserTouching();
-    private native float nativeGetTouchX();
-    private native float nativeGetTouchY();
+    private native void nativePoll();
+    private native int nativeTouchingFlag();
+    private native float nativeTouchX();
+    private native float nativeTouchY();
     private native void nativeDestroy();
 }

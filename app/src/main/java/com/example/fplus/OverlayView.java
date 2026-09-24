@@ -224,31 +224,6 @@ public class OverlayView extends View {
         invalidate();
     }
 
-    /**
-     * 获取当前目标中心点的屏幕像素坐标（[x, y]）。
-     * 供同包内部模块直接读取，无需各自换算坐标。
-     *
-     * @return 屏幕中心点 [x, y]；无目标或 View 尚未布局时返回 null
-     */
-    public float[] getTargetScreenCenter() {
-        float[] box = (displayBox != null) ? displayBox : fadingBox;
-        if (box == null) return null;
-
-        int viewWidth = getWidth();
-        int viewHeight = getHeight();
-        if (viewWidth == 0 || viewHeight == 0 || captureWidth == 0 || captureHeight == 0) return null;
-
-        float scale = Math.min((float) viewWidth / captureWidth, (float) viewHeight / captureHeight);
-        int drawWidth = (int) (captureWidth * scale);
-        int drawHeight = (int) (captureHeight * scale);
-        int offsetX = (viewWidth - drawWidth) / 2;
-        int offsetY = (viewHeight - drawHeight) / 2;
-
-        float centerX = offsetX + box[0] * drawWidth;
-        float centerY = offsetY + box[1] * drawHeight;
-        return new float[]{centerX, centerY};
-    }
-
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);

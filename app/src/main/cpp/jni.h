@@ -1,4 +1,4 @@
-/* 精简 jni.h（Linux/Android 风格），仅够编译 uinput JNI 函数。
+/* 精简 jni.h（Linux/Android 风格），仅够编译 JNI 导出函数。
  * 本代码不使用 JNIEnv 的任何方法，只需类型与导出宏。
  */
 #ifndef JNI_H_

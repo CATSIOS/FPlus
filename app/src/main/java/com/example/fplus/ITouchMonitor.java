@@ -1,6 +1,6 @@
 /*
  * This file is auto-generated.  DO NOT MODIFY.
- * Using: C:\\Users\\57615\\AppData\\Local\\Android\\Sdk\\build-tools\\37.0.0\\aidl.exe -I c:\\Users\\57615\\AndroidStudioProjects\\FPlus\\app\\src\\main\\aidl -o c:\\Users\\57615\\AndroidStudioProjects\\FPlus\\poc\\aidl_out3 c:\\Users\\57615\\AndroidStudioProjects\\FPlus\\app\\src\\main\\aidl\\com\\example\\fplus\\ITouchMonitor.aidl
+ * Using: C:\\Users\\57615\\AppData\\Local\\Android\\Sdk\\build-tools\\37.0.0\\aidl.exe -I c:\\Users\\57615\\AndroidStudioProjects\\FPlus\\app\\src\\main\\aidl -o c:\\Users\\57615\\AndroidStudioProjects\\FPlus\\poc\\aidl_out4 c:\\Users\\57615\\AndroidStudioProjects\\FPlus\\app\\src\\main\\aidl\\com\\example\\fplus\\ITouchMonitor.aidl
  *
  * DO NOT CHECK THIS FILE INTO A CODE TREE (e.g. git, etc..).
  * ALWAYS GENERATE THIS FILE FROM UPDATED AIDL COMPILER
@@ -27,20 +27,13 @@ public interface ITouchMonitor extends android.os.IInterface
     @Override public void start() throws android.os.RemoteException
     {
     }
-    /** 用户是否正用手触摸屏幕 */
-    @Override public boolean isUserTouching() throws android.os.RemoteException
+    /**
+     * 一次性获取全部状态：[是否触摸, 归一化X, 归一化Y]。
+     * 客户端用后台线程轮询本方法并缓存，避免每帧多次跨进程调用阻塞推理线程。
+     */
+    @Override public float[] getState() throws android.os.RemoteException
     {
-      return false;
-    }
-    /** 手指当前归一化 X 坐标（0~1，相对触摸屏原始坐标系） */
-    @Override public float getTouchX() throws android.os.RemoteException
-    {
-      return 0.0f;
-    }
-    /** 手指当前归一化 Y 坐标（0~1，相对触摸屏原始坐标系） */
-    @Override public float getTouchY() throws android.os.RemoteException
-    {
-      return 0.0f;
+      return null;
     }
     @Override
     public android.os.IBinder asBinder() {
@@ -94,25 +87,11 @@ public interface ITouchMonitor extends android.os.IInterface
           reply.writeNoException();
           break;
         }
-        case TRANSACTION_isUserTouching:
+        case TRANSACTION_getState:
         {
-          boolean _result = this.isUserTouching();
+          float[] _result = this.getState();
           reply.writeNoException();
-          reply.writeInt(((_result)?(1):(0)));
-          break;
-        }
-        case TRANSACTION_getTouchX:
-        {
-          float _result = this.getTouchX();
-          reply.writeNoException();
-          reply.writeFloat(_result);
-          break;
-        }
-        case TRANSACTION_getTouchY:
-        {
-          float _result = this.getTouchY();
-          reply.writeNoException();
-          reply.writeFloat(_result);
+          reply.writeFloatArray(_result);
           break;
         }
         default:
@@ -167,53 +146,20 @@ public interface ITouchMonitor extends android.os.IInterface
           _data.recycle();
         }
       }
-      /** 用户是否正用手触摸屏幕 */
-      @Override public boolean isUserTouching() throws android.os.RemoteException
+      /**
+       * 一次性获取全部状态：[是否触摸, 归一化X, 归一化Y]。
+       * 客户端用后台线程轮询本方法并缓存，避免每帧多次跨进程调用阻塞推理线程。
+       */
+      @Override public float[] getState() throws android.os.RemoteException
       {
         android.os.Parcel _data = android.os.Parcel.obtain();
         android.os.Parcel _reply = android.os.Parcel.obtain();
-        boolean _result;
+        float[] _result;
         try {
           _data.writeInterfaceToken(DESCRIPTOR);
-          boolean _status = mRemote.transact(Stub.TRANSACTION_isUserTouching, _data, _reply, 0);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_getState, _data, _reply, 0);
           _reply.readException();
-          _result = (0!=_reply.readInt());
-        }
-        finally {
-          _reply.recycle();
-          _data.recycle();
-        }
-        return _result;
-      }
-      /** 手指当前归一化 X 坐标（0~1，相对触摸屏原始坐标系） */
-      @Override public float getTouchX() throws android.os.RemoteException
-      {
-        android.os.Parcel _data = android.os.Parcel.obtain();
-        android.os.Parcel _reply = android.os.Parcel.obtain();
-        float _result;
-        try {
-          _data.writeInterfaceToken(DESCRIPTOR);
-          boolean _status = mRemote.transact(Stub.TRANSACTION_getTouchX, _data, _reply, 0);
-          _reply.readException();
-          _result = _reply.readFloat();
-        }
-        finally {
-          _reply.recycle();
-          _data.recycle();
-        }
-        return _result;
-      }
-      /** 手指当前归一化 Y 坐标（0~1，相对触摸屏原始坐标系） */
-      @Override public float getTouchY() throws android.os.RemoteException
-      {
-        android.os.Parcel _data = android.os.Parcel.obtain();
-        android.os.Parcel _reply = android.os.Parcel.obtain();
-        float _result;
-        try {
-          _data.writeInterfaceToken(DESCRIPTOR);
-          boolean _status = mRemote.transact(Stub.TRANSACTION_getTouchY, _data, _reply, 0);
-          _reply.readException();
-          _result = _reply.readFloat();
+          _result = _reply.createFloatArray();
         }
         finally {
           _reply.recycle();
@@ -224,9 +170,7 @@ public interface ITouchMonitor extends android.os.IInterface
     }
     static final int TRANSACTION_destroy = (android.os.IBinder.FIRST_CALL_TRANSACTION + 16777114);
     static final int TRANSACTION_start = (android.os.IBinder.FIRST_CALL_TRANSACTION + 1);
-    static final int TRANSACTION_isUserTouching = (android.os.IBinder.FIRST_CALL_TRANSACTION + 2);
-    static final int TRANSACTION_getTouchX = (android.os.IBinder.FIRST_CALL_TRANSACTION + 3);
-    static final int TRANSACTION_getTouchY = (android.os.IBinder.FIRST_CALL_TRANSACTION + 4);
+    static final int TRANSACTION_getState = (android.os.IBinder.FIRST_CALL_TRANSACTION + 2);
   }
   /** @hide */
   public static final java.lang.String DESCRIPTOR = "com.example.fplus.ITouchMonitor";
@@ -234,10 +178,9 @@ public interface ITouchMonitor extends android.os.IInterface
   public void destroy() throws android.os.RemoteException;
   /** 开始监听真实触摸屏 */
   public void start() throws android.os.RemoteException;
-  /** 用户是否正用手触摸屏幕 */
-  public boolean isUserTouching() throws android.os.RemoteException;
-  /** 手指当前归一化 X 坐标（0~1，相对触摸屏原始坐标系） */
-  public float getTouchX() throws android.os.RemoteException;
-  /** 手指当前归一化 Y 坐标（0~1，相对触摸屏原始坐标系） */
-  public float getTouchY() throws android.os.RemoteException;
+  /**
+   * 一次性获取全部状态：[是否触摸, 归一化X, 归一化Y]。
+   * 客户端用后台线程轮询本方法并缓存，避免每帧多次跨进程调用阻塞推理线程。
+   */
+  public float[] getState() throws android.os.RemoteException;
 }

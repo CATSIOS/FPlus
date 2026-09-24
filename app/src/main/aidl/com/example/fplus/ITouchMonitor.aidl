@@ -15,12 +15,9 @@ interface ITouchMonitor {
     /** 开始监听真实触摸屏 */
     void start() = 1;
 
-    /** 用户是否正用手触摸屏幕 */
-    boolean isUserTouching() = 2;
-
-    /** 手指当前归一化 X 坐标（0~1，相对触摸屏原始坐标系） */
-    float getTouchX() = 3;
-
-    /** 手指当前归一化 Y 坐标（0~1，相对触摸屏原始坐标系） */
-    float getTouchY() = 4;
+    /**
+     * 一次性获取全部状态：[是否触摸, 归一化X, 归一化Y]。
+     * 客户端用后台线程轮询本方法并缓存，避免每帧多次跨进程调用阻塞推理线程。
+     */
+    float[] getState() = 2;
 }
