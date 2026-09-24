@@ -24,3 +24,10 @@ probe_model.py
 *.onnx
 # 图标源文件（非 app 资源，保留本地）
 FPlus_logo.png
+
+# 本地开发过程文件（含 zig 编译器包等大文件，不上传）
+/poc/
+# 本地 APK 备份
+/backup/
+# 本地构建脚本
+/编译正式版.bat
