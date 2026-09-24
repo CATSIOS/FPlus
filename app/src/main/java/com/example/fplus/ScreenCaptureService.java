@@ -76,7 +76,7 @@ public class ScreenCaptureService extends Service {
     private float swipeDeadzone = 120f;               // 死区（px）：偏离中心小于此值不滑
     private int swipeMaxDist = 400;                   // 最大滑动距离（px）：单次滑动上限，防过冲
     private float swipeCurve = 1.0f;                  // 非线性指数：1=线性，>1 近处精细/远处激进
-    private static final long SWIPE_COOLDOWN_MS = 50;  // 两次滑动最小间隔（lerp 逼近需连续小幅滑动）
+    private static final long SWIPE_COOLDOWN_MS = 20;  // 两次滑动最小间隔（lerp 逼近需连续小幅滑动）
     private static final int SWIPE_MIN_DIST = 8;         // 最小滑动距离：太近不滑，避免终点抖动
 
     private MediaProjection.Callback projectionCallback;
@@ -672,8 +672,10 @@ public class ScreenCaptureService extends Service {
         int ex = (int) (centerX + ux * swipeDist);
         int ey = (int) (centerY + uy * swipeDist);
 
-        // 滑动耗时与距离成正比，clamp 到合理范围
-        long duration = Math.max(120, Math.min(400, swipeDist * 2L));
+        // 滑动耗时：压成「短脉冲」60~120ms。原上限 400ms 会让单次滑动变成明显的一顿一停
+        // （脉冲期间 swipeInProgress 阻挡后续帧），叠加 0.35 增益需要多次才逼近中心，
+        // 视觉上就是「卡几次才到中间」。压短后变为多而短的脉冲，跟手更连续。
+        long duration = Math.max(60, Math.min(120, swipeDist));
 
         lastSwipeTime = now;
         swipeInProgress.set(true);

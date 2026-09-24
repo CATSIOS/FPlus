@@ -2057,7 +2057,10 @@ public class PoseEstimator {
         // trackVelX 单位：60fps 基准每帧位移，× 60 转换为"每秒位移"再 × adaptiveLeadSec
         // 补位帧（heldByLock）已由 coast 外推过（或原地补位），跳过预测外推避免双重叠加冲过头
         // LEAD_PREDICT_ENABLED=false：绿框预判关闭，不做外推，紧贴检测位置
-        if (bestPose != null && trackedBox != null && !heldByLock && LEAD_PREDICT_ENABLED) {
+        // CMC 生效期间速度已被冻结（trackVel 是滑动前的陈旧值），此时外推方向不可信，
+        // 会污染绿框位置、并连带影响滑动跟随算出的偏差，故一并跳过外推
+        if (bestPose != null && trackedBox != null && !heldByLock && LEAD_PREDICT_ENABLED
+                && !(CMC_ENABLED && cameraMotionActive)) {
             float speedSq = trackVelX * trackVelX + trackVelY * trackVelY;
             if (speedSq >= MIN_VEL * MIN_VEL) {
                 float predDx = trackVelX * 60f * adaptiveLeadSec;
