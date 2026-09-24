@@ -65,6 +65,8 @@ public class ScreenCaptureService extends Service {
 
     // ===== 视角跟随滑动 =====
     private ExecutorService swipeExecutor;            // 单线程串行执行滑动，避免两段触摸流重叠
+    private TouchMonitorClient touchMonitor;          // 触摸屏监听（检测用户手动触摸 → 让路）
+    private long lastTouchDiag = 0;                   // 触摸坐标诊断日志限流
     private final AtomicBoolean swipeInProgress = new AtomicBoolean(false);
     private long lastSwipeTime = 0;                   // 上次滑动发起时间，用于冷却
     private int screenWidth = 0;                      // 旋转适配后的真实屏幕尺寸
@@ -201,6 +203,12 @@ public class ScreenCaptureService extends Service {
         if (swipeExecutor == null || swipeExecutor.isShutdown()) {
             swipeExecutor = Executors.newSingleThreadExecutor();
         }
+
+        // 初始化触摸屏监听（检测让路：用户手动触摸时暂停自动跟随）
+        if (touchMonitor == null) {
+            touchMonitor = new TouchMonitorClient();
+        }
+        touchMonitor.bind();
 
         // PARTIAL_WAKE_LOCK：只保持 CPU 运行（屏幕关闭也没用，因为我们要触控/屏显）
         // 作用：避免系统调度器在用户短暂不触控时进入轻度 idle 并立即降频降压
@@ -611,6 +619,11 @@ public class ScreenCaptureService extends Service {
             swipeExecutor.shutdownNow();
             swipeExecutor = null;
         }
+        // 解绑触摸屏监听
+        if (touchMonitor != null) {
+            touchMonitor.unbind();
+            touchMonitor = null;
+        }
         instance = null;
     }
 
@@ -625,6 +638,22 @@ public class ScreenCaptureService extends Service {
         if (!swipeEnabled) return;   // 未开启滑动跟随
         if (screenWidth <= 0 || screenHeight <= 0) return;
         if (swipeExecutor == null || swipeExecutor.isShutdown()) return;
+
+        // 检测让路：仅当用户手指在屏幕右下 1/4 区域按下时才让路
+        if (touchMonitor != null && touchMonitor.isUserTouching()) {
+            float tx = touchMonitor.getTouchX();
+            float ty = touchMonitor.getTouchY();
+            long now = System.currentTimeMillis();
+            if (now - lastTouchDiag > 1000) {
+                lastTouchDiag = now;
+                Log.d(TAG, "touch x=" + String.format(java.util.Locale.US, "%.2f", tx)
+                        + " y=" + String.format(java.util.Locale.US, "%.2f", ty));
+            }
+            // 屏幕右下 = 触摸屏 y 大（屏幕右）+ x 小（屏幕下），横屏旋转映射
+            if (tx <= 0.5f && ty >= 0.5f) {
+                return;
+            }
+        }
 
         // 滑动执行中：跳过本帧，等上一段完成
         if (swipeInProgress.get()) return;
@@ -672,10 +701,10 @@ public class ScreenCaptureService extends Service {
         int ex = (int) (centerX + ux * swipeDist);
         int ey = (int) (centerY + uy * swipeDist);
 
-        // 滑动耗时：压成「短脉冲」60~120ms。原上限 400ms 会让单次滑动变成明显的一顿一停
-        // （脉冲期间 swipeInProgress 阻挡后续帧），叠加 0.35 增益需要多次才逼近中心，
-        // 视觉上就是「卡几次才到中间」。压短后变为多而短的脉冲，跟手更连续。
-        long duration = Math.max(60, Math.min(120, swipeDist));
+        // 滑动耗时：压成「短脉冲」60~120ms，并加 ±20% 随机抖动，
+        // 避免每次脉冲时长完全一致（反作弊会把固定时长当注入特征）
+        long base = Math.max(60, Math.min(120, swipeDist));
+        long duration = base + (long) ((Math.random() * 0.4 - 0.2) * base);
 
         lastSwipeTime = now;
         swipeInProgress.set(true);

@@ -3,3 +3,8 @@
 # 库体积很小，保留类名以免 R8 重命名 / 内联后出现运行时问题。
 -keep class rikka.shizuku.** { *; }
 -keep class moe.shizuku.** { *; }
+
+# 触摸屏监听 UserService：Shizuku 通过反射 new 本类（无参/Context 构造），
+# 且 AIDL 的 destroy() 由 Shizuku 用固定 transaction code 调用，必须保留类名与方法。
+-keep class com.example.fplus.TouchMonitorService { *; }
+-keep class com.example.fplus.ITouchMonitor { *; }
