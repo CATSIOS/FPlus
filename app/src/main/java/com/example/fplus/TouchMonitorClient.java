@@ -19,9 +19,9 @@ public class TouchMonitorClient {
     private static final String TAG = "TouchMonitorClient";
     private static final long POLL_INTERVAL_MS = 30;   // 轮询周期
 
-    private ITouchMonitor service;
-    private boolean bound = false;
-    private boolean started = false;
+    private volatile ITouchMonitor service;
+    private volatile boolean bound = false;
+    private volatile boolean started = false;
 
     // ===== 后台轮询缓存（推理线程直接读，无跨进程开销）=====
     private volatile boolean userTouching = false;

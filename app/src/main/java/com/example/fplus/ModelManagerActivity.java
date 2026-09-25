@@ -43,9 +43,19 @@ public class ModelManagerActivity extends AppCompatActivity {
     }
 
     private void loadModels() {
+        // 用 applicationContext 做网络/文件 IO、WeakReference 回传 Activity，
+        // 避免后台线程持有 Activity 引用导致内存泄漏（用户中途退出时无法回收）。
+        final android.content.Context appContext = getApplicationContext();
+        final android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        final java.lang.ref.WeakReference<ModelManagerActivity> weakSelf =
+                new java.lang.ref.WeakReference<>(this);
         new Thread(() -> {
-            List<String> models = ModelManager.listAllModels(this);
-            runOnUiThread(() -> render(models));
+            List<String> models = ModelManager.listAllModels(appContext);
+            mainHandler.post(() -> {
+                ModelManagerActivity a = weakSelf.get();
+                if (a == null || a.isFinishing() || a.isDestroyed()) return;
+                a.render(models);
+            });
         }).start();
     }
 
@@ -142,23 +152,34 @@ public class ModelManagerActivity extends AppCompatActivity {
         if (status != null) status.setText(R.string.model_status_downloading);
         if (button != null) button.setEnabled(false);
 
-        ModelManager.download(this, model,
-                (downloaded, total) -> runOnUiThread(() -> {
-                    TextView s = statusViews.get(model);
+        final android.content.Context appContext = getApplicationContext();
+        final android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        final java.lang.ref.WeakReference<ModelManagerActivity> weakSelf =
+                new java.lang.ref.WeakReference<>(this);
+
+        ModelManager.download(appContext, model,
+                (downloaded, total) -> mainHandler.post(() -> {
+                    ModelManagerActivity a = weakSelf.get();
+                    if (a == null || a.isDestroyed()) return;
+                    TextView s = a.statusViews.get(model);
                     if (s != null && total > 0) {
                         int pct = (int) (downloaded * 100 / total);
                         s.setText("下载中 " + pct + "%");
                     }
                 }),
-                file -> runOnUiThread(() -> {
-                    downloadingModels.remove(model);
-                    refreshModelStatus(model);
-                    Toast.makeText(this, "模型下载完成", Toast.LENGTH_SHORT).show();
+                file -> mainHandler.post(() -> {
+                    ModelManagerActivity a = weakSelf.get();
+                    if (a == null || a.isDestroyed()) return;
+                    a.downloadingModels.remove(model);
+                    a.refreshModelStatus(model);
+                    Toast.makeText(a, "模型下载完成", Toast.LENGTH_SHORT).show();
                 }),
-                err -> runOnUiThread(() -> {
-                    downloadingModels.remove(model);
-                    refreshModelStatus(model);
-                    Toast.makeText(this, "下载失败：" + err, Toast.LENGTH_SHORT).show();
+                err -> mainHandler.post(() -> {
+                    ModelManagerActivity a = weakSelf.get();
+                    if (a == null || a.isDestroyed()) return;
+                    a.downloadingModels.remove(model);
+                    a.refreshModelStatus(model);
+                    Toast.makeText(a, "下载失败：" + err, Toast.LENGTH_SHORT).show();
                 }));
     }
 

@@ -48,6 +48,15 @@ public class ShizukuInputHelper {
                 0);
     }
 
+    /** 注入单个事件并确保 recycle：即使反射 invoke 抛异常也不泄漏 MotionEvent */
+    private static void injectAndRecycle(MotionEvent event) throws Throwable {
+        try {
+            sInjectMethod.invoke(sInputManager, event, 0);
+        } finally {
+            event.recycle();
+        }
+    }
+
     private static synchronized boolean init() {
         if (sInputManager != null) return true;
         try {
@@ -157,8 +166,7 @@ public class ShizukuInputHelper {
             long upTime = downTime + duration;
             MotionEvent up = obtainTouch(downTime, upTime,
                     MotionEvent.ACTION_UP, ex, ey, 0.3f + (float) Math.random() * 0.15f);
-            sInjectMethod.invoke(sInputManager, up, 0);
-            up.recycle();
+            injectAndRecycle(up);
 
             return true;
         } catch (Throwable t) {

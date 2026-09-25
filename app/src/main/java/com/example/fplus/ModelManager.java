@@ -195,10 +195,16 @@ public class ModelManager {
                 }
 
                 if (tmp.length() > 0) {
-                    if (target.exists()) {
-                        target.delete();
+                    if (target.exists() && !target.delete()) {
+                        error.onError("无法覆盖旧模型文件");
+                        return;
                     }
-                    tmp.renameTo(target);
+                    if (!tmp.renameTo(target)) {
+                        // rename 失败（极少见）：清理残留 tmp，避免下次加载到半截文件
+                        tmp.delete();
+                        error.onError("模型文件保存失败");
+                        return;
+                    }
                     success.onSuccess(target);
                 } else {
                     error.onError("下载内容为空");

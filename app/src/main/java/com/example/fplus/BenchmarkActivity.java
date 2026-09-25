@@ -43,89 +43,101 @@ public class BenchmarkActivity extends AppCompatActivity {
         btnBenchmark.setEnabled(false);
         benchmarkResult.setText("测速中…");
 
+        // 用 applicationContext 做模型 IO、WeakReference 回传 Activity，
+        // 避免后台线程持有 Activity 引用导致内存泄漏（用户中途退出时无法回收）。
+        final android.content.Context appContext = getApplicationContext();
+        final android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        final java.lang.ref.WeakReference<BenchmarkActivity> weakSelf =
+                new java.lang.ref.WeakReference<>(this);
+
         new Thread(() -> {
             Bitmap testBitmap = Bitmap.createBitmap(720, 450, Bitmap.Config.ARGB_8888);
-            testBitmap.eraseColor(0xFF808080);
+            try {
+                testBitmap.eraseColor(0xFF808080);
 
-            String[] models = ModelManager.listLocalModels(this).toArray(new String[0]);
-            if (models.length == 0) {
-                runOnUiThread(() -> {
-                    btnBenchmark.setEnabled(true);
-                    benchmarkResult.setText("没有已下载的模型，请先在模型管理中下载");
-                });
-                testBitmap.recycle();
-                return;
-            }
-            // 测速只测 NPU / GPU，CPU 永远最慢，跳过以大幅缩短测速时间
-            PoseEstimator.Backend[] backends = {
-                    PoseEstimator.Backend.NNAPI,
-                    PoseEstimator.Backend.GPU
-            };
+                String[] models = ModelManager.listLocalModels(appContext).toArray(new String[0]);
+                if (models.length == 0) {
+                    mainHandler.post(() -> {
+                        BenchmarkActivity a = weakSelf.get();
+                        if (a == null || a.isDestroyed()) return;
+                        a.btnBenchmark.setEnabled(true);
+                        a.benchmarkResult.setText("没有已下载的模型，请先在模型管理中下载");
+                    });
+                    return;
+                }
+                // 测速只测 NPU / GPU，CPU 永远最慢，跳过以大幅缩短测速时间
+                PoseEstimator.Backend[] backends = {
+                        PoseEstimator.Backend.NNAPI,
+                        PoseEstimator.Backend.GPU
+                };
 
-            List<BenchResult> results = new ArrayList<>();
-            long bestMs = Long.MAX_VALUE;
-            String bestModel = null;
-            PoseEstimator.Backend bestBackend = null;
+                List<BenchResult> results = new ArrayList<>();
+                long bestMs = Long.MAX_VALUE;
+                String bestModel = null;
+                PoseEstimator.Backend bestBackend = null;
 
-            for (String model : models) {
-                for (PoseEstimator.Backend backend : backends) {
-                    long ms = benchmarkOne(testBitmap, model, backend);
-                    String label = modelLabel(model) + " + " + backendLabel(backend);
-                    results.add(new BenchResult(label, ms));
-                    if (ms > 0 && ms < bestMs) {
-                        bestMs = ms;
-                        bestModel = model;
-                        bestBackend = backend;
+                for (String model : models) {
+                    for (PoseEstimator.Backend backend : backends) {
+                        long ms = benchmarkOne(appContext, testBitmap, model, backend);
+                        String label = modelLabel(model) + " + " + backendLabel(backend);
+                        results.add(new BenchResult(label, ms));
+                        if (ms > 0 && ms < bestMs) {
+                            bestMs = ms;
+                            bestModel = model;
+                            bestBackend = backend;
+                        }
                     }
                 }
-            }
 
-            // 按耗时从快到慢排序（失败放最后）
-            Collections.sort(results, (a, b) -> {
-                if (a.ms <= 0 && b.ms <= 0) return 0;
-                if (a.ms <= 0) return 1;
-                if (b.ms <= 0) return -1;
-                return Long.compare(a.ms, b.ms);
-            });
+                // 按耗时从快到慢排序（失败放最后）
+                Collections.sort(results, (a, b) -> {
+                    if (a.ms <= 0 && b.ms <= 0) return 0;
+                    if (a.ms <= 0) return 1;
+                    if (b.ms <= 0) return -1;
+                    return Long.compare(a.ms, b.ms);
+                });
 
-            StringBuilder sb = new StringBuilder();
-            for (BenchResult r : results) {
-                sb.append(r.label).append(": ")
-                        .append(r.ms > 0 ? r.ms + "ms" : "失败")
-                        .append("\n");
-            }
-            Log.d("Benchmark", "测速结果: " + sb.toString().replace("\n", " | "));
-
-            testBitmap.recycle();
-
-            final String resultText = sb.toString();
-            final String fModel = bestModel;
-            final PoseEstimator.Backend fBackend = bestBackend;
-
-            runOnUiThread(() -> {
-                btnBenchmark.setEnabled(true);
-                if (fModel != null && fBackend != null) {
-                    prefs.edit()
-                            .putString("model_name", fModel)
-                            .putString("backend", fBackend.name())
-                            .apply();
-                    benchmarkResult.setText(resultText + "\n已自动选择: "
-                            + modelLabel(fModel) + " + " + backendLabel(fBackend));
-                } else {
-                    benchmarkResult.setText(resultText + "\n测速失败");
+                StringBuilder sb = new StringBuilder();
+                for (BenchResult r : results) {
+                    sb.append(r.label).append(": ")
+                            .append(r.ms > 0 ? r.ms + "ms" : "失败")
+                            .append("\n");
                 }
-            });
+                Log.d("Benchmark", "测速结果: " + sb.toString().replace("\n", " | "));
+
+                final String resultText = sb.toString();
+                final String fModel = bestModel;
+                final PoseEstimator.Backend fBackend = bestBackend;
+
+                mainHandler.post(() -> {
+                    BenchmarkActivity a = weakSelf.get();
+                    if (a == null || a.isDestroyed()) return;
+                    a.btnBenchmark.setEnabled(true);
+                    if (fModel != null && fBackend != null) {
+                        a.prefs.edit()
+                                .putString("model_name", fModel)
+                                .putString("backend", fBackend.name())
+                                .apply();
+                        a.benchmarkResult.setText(resultText + "\n已自动选择: "
+                                + modelLabel(fModel) + " + " + backendLabel(fBackend));
+                    } else {
+                        a.benchmarkResult.setText(resultText + "\n测速失败");
+                    }
+                });
+            } finally {
+                testBitmap.recycle();
+            }
         }).start();
     }
 
-    private long benchmarkOne(Bitmap bitmap, String model, PoseEstimator.Backend backend) {
-        if (!ModelManager.isDownloaded(this, model)) {
+    private static long benchmarkOne(android.content.Context context, Bitmap bitmap, String model, PoseEstimator.Backend backend) {
+        if (!ModelManager.isDownloaded(context, model)) {
             Log.w("Benchmark", model + " 未下载，跳过测速");
             return -1;
         }
         PoseEstimator estimator = null;
         try {
-            estimator = new PoseEstimator(this, model, backend);
+            estimator = new PoseEstimator(context, model, backend);
             // 预热 2 次
             for (int i = 0; i < 2; i++) {
                 estimator.estimate(bitmap);
@@ -148,13 +160,13 @@ public class BenchmarkActivity extends AppCompatActivity {
         }
     }
 
-    private String modelLabel(String model) {
+    private static String modelLabel(String model) {
         return model.endsWith(".tflite")
                 ? model.substring(0, model.length() - ".tflite".length())
                 : model;
     }
 
-    private String backendLabel(PoseEstimator.Backend backend) {
+    private static String backendLabel(PoseEstimator.Backend backend) {
         switch (backend) {
             case NNAPI:
                 return "NPU";

@@ -179,9 +179,9 @@ public class PoseEstimator {
     private long dualTotalAccum;
     private int dualFrames;
     // 第二路当前帧 zoom 区域（每帧由 preprocessBitmap2 计算，供 parseOutput2 反变换）
-    private int zoomSize;
-    private int zoomX;
-    private int zoomY;
+    private volatile int zoomSize;
+    private volatile int zoomX;
+    private volatile int zoomY;
 
     // 输出维度顺序：true 表示 [1, channels, anchors]，false 表示 [1, anchors, channels]
     private boolean channelFirst = true;
@@ -200,9 +200,9 @@ public class PoseEstimator {
     // 实际输入尺寸（从模型 inputShape 动态读取，支持 640/416 等）
     private int inputSize = INPUT_SIZE;
 
-    private int roiX;
-    private int roiY;
-    private int roiSize;
+    private volatile int roiX;
+    private volatile int roiY;
+    private volatile int roiSize;
 
     private int originalWidth;
     private int originalHeight;

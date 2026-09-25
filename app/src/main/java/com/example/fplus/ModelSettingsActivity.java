@@ -28,13 +28,21 @@ public class ModelSettingsActivity extends AppCompatActivity {
         }
         toolbar.setNavigationOnClickListener(v -> finish());
 
-        SharedPreferences prefs = getSharedPreferences("fplus_settings", MODE_PRIVATE);
-        RadioGroup radioModel = findViewById(R.id.radio_model);
-
-        // 后台拉取模型列表（含网络请求），回主线程动态填充
+        // 后台拉取模型列表（含网络请求），回主线程动态填充。
+        // 用 applicationContext 做网络/文件 IO、WeakReference 回传 Activity，
+        // 避免后台线程持有 Activity 引用导致内存泄漏（用户中途退出时无法回收）。
+        final android.content.Context appContext = getApplicationContext();
+        final android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        final java.lang.ref.WeakReference<ModelSettingsActivity> weakSelf =
+                new java.lang.ref.WeakReference<>(this);
         new Thread(() -> {
-            List<String> models = ModelManager.listAllModels(this);
-            runOnUiThread(() -> populate(radioModel, models, prefs));
+            List<String> models = ModelManager.listAllModels(appContext);
+            mainHandler.post(() -> {
+                ModelSettingsActivity a = weakSelf.get();
+                if (a == null || a.isFinishing() || a.isDestroyed()) return;
+                a.populate(a.findViewById(R.id.radio_model), models,
+                        a.getSharedPreferences("fplus_settings", MODE_PRIVATE));
+            });
         }).start();
     }
 

@@ -57,11 +57,11 @@ public class ScreenCaptureService extends Service {
     private final AtomicBoolean inferenceBusy = new AtomicBoolean(false);
     private Handler mainHandler;
 
-    private PoseEstimator poseEstimator;
-    private OverlayView overlayView;
+    private volatile PoseEstimator poseEstimator;
+    private volatile OverlayView overlayView;
     private WindowManager windowManager;
     private PowerManager.WakeLock cpuWakeLock;  // PARTIAL_WAKE_LOCK：保持 CPU 不进入 idle 降压
-    private boolean isCapturing = false;
+    private volatile boolean isCapturing = false;
 
     // ===== 视角跟随滑动 =====
     private ExecutorService swipeExecutor;            // 单线程串行执行滑动，避免两段触摸流重叠
@@ -411,7 +411,9 @@ public class ScreenCaptureService extends Service {
 
             // 兜底路径（罕见：非紧致行或 pixelStride!=4）：保留逐像素提取兼容
             buffer.rewind();
-            int totalBytes = rowStride * captureHeight;
+            // 用 buffer.remaining() 而非 rowStride*height：Image.Plane 最后一行通常无 padding，
+            // 实际 buffer 大小 = rowStride*(h-1) + pixelStride*w，按行高乘会高估导致越界读
+            int totalBytes = buffer.remaining();
             if (captureByteArray == null || captureByteArray.length < totalBytes) {
                 captureByteArray = new byte[totalBytes];
             }
@@ -603,9 +605,16 @@ public class ScreenCaptureService extends Service {
             } catch (Throwable ignored) { /* 重复 release 或系统已回收 */ }
             cpuWakeLock = null;
         }
-        // 关闭滑动执行器，等待正在注入的触摸流结束
+        // 关闭滑动执行器，等待正在注入的触摸流结束（单次滑动最长 120ms，短暂等待不阻塞主线程太久）
         if (swipeExecutor != null) {
             swipeExecutor.shutdownNow();
+            try {
+                if (!swipeExecutor.awaitTermination(200, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    swipeExecutor.shutdownNow();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
             swipeExecutor = null;
         }
         // 解绑触摸屏监听
